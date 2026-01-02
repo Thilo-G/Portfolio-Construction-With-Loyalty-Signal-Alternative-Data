@@ -695,6 +695,10 @@ df_long['NEW_REV_GROWTH'] = ((df_long['ACQ_RATE_PCT']) * (1-df_long['#SHARE_RET_
 
 df_long['EPR'] = (df_long['IS_OPER_INC'] / df_long['SALES_REV_TURN'].replace(0, np.nan))
 df_long['EPS'] = (df_long['IS_OPER_INC'] / df_long['BS_SH_OUT'].replace(0, np.nan))
+df_long['REV_MULTIPLE'] = df_long['HISTORICAL_MARKET_CAP'] / df_long['SALES_REV_TURN'].replace(0, np.nan)
+
+
+
 
 #Calculate stock returns
 #Calculate stock returns
@@ -744,6 +748,7 @@ df_long['BTM_LAG'] = btm.groupby(level='FIRM').shift(1)
 df_long['BTM'] = btm
 
 
+
 # 4) Excess return calculation
 df_long['EXCESS_RET'] = df_long['RET_ARITH'] - df_long['RF']
 
@@ -754,6 +759,70 @@ output_file = "C:\\Users\\thkraft\\eCommerce-Goethe Dropbox\\Thilo Kraft\\Thilo(
 df_long.to_excel(output_file, index=False)
 print(f"Data successfully saved to: {output_file}")
 print(f"Number of Firms: {df_long.index.get_level_values('FIRM').nunique()}")
+
+
+# =============================================================================
+# Summary Statistics Table (All Firms, All Periods)
+# =============================================================================
+
+print("\n" + "="*80)
+print("SUMMARY STATISTICS - ALL FIRMS & PERIODS")
+print("="*80)
+
+# Define the variables to summarize
+summary_vars = {
+    'Assets': 'BS_TOT_ASSET',
+    'Market_Value': 'HISTORICAL_MARKET_CAP',
+    'Revenue': 'SALES_REV_TURN',
+    'RRR (%)': 'RRR_PCT',
+    'Acq_Rate (%)': 'ACQ_RATE_PCT',
+    'Growth_Mix': '#GROWTH_MIX',
+    'Rev_Growth (%)': 'REV_GROWTH_PCT',
+    'BTM': 'BTM',
+    'Book_Value': 'BS_TOT_ASSET',  # Using total assets as proxy for book value
+    'PM (%)': 'PM_OPER_PCT',
+    'CF_Growth (%)': 'IS_OPER_INC_GROWTH_PCT',
+    'REV_GROWTH_PCT': 'REV_GROWTH_PCT'
+}
+
+# Create summary statistics
+summary_stats = []
+
+for display_name, col_name in summary_vars.items():
+    if col_name in df_long.columns:
+        data = pd.to_numeric(df_long[col_name], errors='coerce').dropna()
+        
+        stats = {
+            'Variable': display_name,
+            'N_Obs': len(data),
+            'Mean': data.mean(),
+            'StdDev': data.std(),
+            'P25': data.quantile(0.25),
+            'Median': data.quantile(0.50),
+            'P75': data.quantile(0.75),
+            'Min': data.min(),
+            'Max': data.max()
+        }
+        summary_stats.append(stats)
+    else:
+        print(f"⚠️ Warning: Column '{col_name}' not found in df_long")
+
+# Create DataFrame
+summary_table = pd.DataFrame(summary_stats)
+
+# Format numbers for display
+summary_table_formatted = summary_table.copy()
+for col in ['Mean', 'StdDev', 'P25', 'Median', 'P75', 'Min', 'Max']:
+    summary_table_formatted[col] = summary_table_formatted[col].map(lambda x: f"{x:,.2f}")
+summary_table_formatted['N_Obs'] = summary_table_formatted['N_Obs'].map(lambda x: f"{x:,}")
+
+print("\n" + summary_table_formatted.to_string(index=False))
+
+# Export to Excel (optional)
+output_path = "C:\\Users\\thkraft\\eCommerce-Goethe Dropbox\\Thilo Kraft\\Thilo(privat)\\Privat\\Research\\RRR_FinancialImplication\\Data\\summary_statistics.xlsx"
+summary_table.to_excel(output_path, index=False)
+print(f"\n✅ Summary statistics exported to: {output_path}")
+
 
 #==============================================================================
 # 5. Regression Analysis
@@ -809,7 +878,6 @@ def analyze_firm_correlations(df_long, var1='RRR_PCT', var2='RRR_PCT_LAG1', min_
     print(f"\nSummary Statistics:")
     print(f"Mean Correlation:   {mean_corr:.4f}")
     print(f"Median Correlation: {median_corr:.4f}")
-    print(f"Std Deviation:      {std_corr:.4f}")
     print(f"Number of Firms:    {len(corr_df)}")
     
     print(f"\nDistribution:")
@@ -932,7 +1000,7 @@ analyze_columns(['IS_SGA_EXPENSE_PCT','ACQ_RATE_PCT', 'ACQ_RATE_PCT_LAG1','RRR_P
 analyze_columns(['IS_SGA_EXPENSE', 'RETAINED_REV_EST', 'NEW_REV_EST'], firm_effect=True, time_effect=True,show_plots=False)
 # ret revenue is significant but not new rev
 
-
+analyze_columns(['EPR', 'RRR_PCT','RRR_PCT_LAG1'], firm_effect=True, time_effect=True,show_plots=False)
 
 '''
 multiply CLV by average profit margin
@@ -1005,7 +1073,7 @@ from sklearn.pipeline import Pipeline
 # --- Step 1: Define variables ---
 y_var = 'EXCESS_RET'
 x_vars = [
-    'MKT_RF','SIZE','BTM', 'RRR_PCT_LAG1','IS_OPER_INC','IS_OPER_INC_LAG1',
+    'MKT_RF','SIZE','BTM', 'RRR_PCT_LAG1','RRR_PCT_LAG2','IS_OPER_INC','IS_OPER_INC_LAG1',
     'RET_REV_ACQ_LAG','RET_REV_ACQ_LAG2','RET_REV_ACQ_LAG3','RET_REV_ACQ_LAG4',
     'RRR_PCT_LAG4','RRR_PCT','ACQ_RATE_PCT',#'ACQ_RATE_PCT_LAG1',#
     'ACQ_RATE_PCT_LAG4'
@@ -1069,9 +1137,9 @@ import matplotlib.pyplot as plt
 # --- Step 1: Define y and X variables ---
 y_var = 'EXCESS_RET'
 x_vars = [
-    'MKT_RF','SIZE','BTM','RRR_PCT_LAG1','IS_OPER_INC','IS_OPER_INC_LAG1',
+    'MKT_RF','SIZE','BTM','RRR_PCT_LAG1','RRR_PCT_LAG2','IS_OPER_INC','IS_OPER_INC_LAG1',
     'RET_REV_ACQ_LAG','RET_REV_ACQ_LAG2','RET_REV_ACQ_LAG3','RET_REV_ACQ_LAG4',
-    'RRR_PCT_LAG4','RRR_PCT','ACQ_RATE_PCT','ACQ_RATE_PCT_LAG1','ACQ_RATE_PCT_LAG4'
+    'RRR_PCT_LAG4','RRR_PCT','ACQ_RATE_PCT','ACQ_RATE_PCT_LAG4'
 ]
 
 # --- Step 2: Prepare data (drop missing) ---
@@ -1743,8 +1811,22 @@ returns = returns.drop(columns=['FirmVar'])
 
 print(returns.head())
 
+
+# This ensures Jan-Mar 2020 use Q4 2019 RRR_LAG (which is Q3 2019 RRR)
+### Alternativly use ty the 1 month shift for reporting dates
+returns['QUARTER'] = (
+    returns['Date']
+    .dt.to_period('Q')
+    .apply(lambda x: x - 1)  # Shift back one quarter
+    .dt.to_timestamp('Q', 'end')
+)
+'''
 # Assign each month to its quarter end
 returns['QUARTER'] = returns['Date'].dt.to_period('Q').dt.to_timestamp('Q', 'end')
+it should assing each quarter to its quarter start
+
+'''
+
 
 
 # Prepare the quarterly RRR data
@@ -1757,9 +1839,6 @@ df_quarterly['DATE'] = pd.to_datetime(df_quarterly['DATE'])
 df_quarterly['QUARTER'] = df_quarterly['DATE'].dt.to_period('Q').dt.to_timestamp('Q', 'end')
 
 #Step 3: Merge Quarterly RRR Signal onto Monthly Returns
-
-
-
 
 
 #Prepare the Quarterly RRR Data
@@ -1884,67 +1963,48 @@ port_rets_eq, cum_returns_eq = calc_and_plot_portfolio_returns_from_long(
     returns, weight_type='equal', benchmarks=['SPW INDEX']
 )
 
+# Calculate value-weighted market return for all sample firms (excluding SPX)
+sample_firms = returns[~returns['FIRM'].isin(['SPX INDEX', 'SPW INDEX'])].copy()
+sample_firms['MCAP'] = pd.to_numeric(sample_firms['HISTORICAL_MARKET_CAP'], errors='coerce')
 
-#### Calculate and plot portfolio returns with lagged RRR
+# Calculate total market cap per month
+sample_firms['MCAP_TOTAL'] = sample_firms.groupby('Date')['MCAP'].transform('sum')
+sample_firms['w'] = sample_firms['MCAP'] / sample_firms['MCAP_TOTAL']
+sample_firms['w_return'] = sample_firms['w'] * sample_firms['RETURN_LOG']
 
-#no lag
-df_long['QUARTER'] = df_long.index.get_level_values('DATE').to_period('Q')
-df_long['RRR_LAG0'] = df_long.groupby(level='FIRM')['#RRR'].shift(0)
-df_long['RRR_LAG0'] = pd.to_numeric(df_long['RRR_LAG0'], errors='coerce')
-df_long['quartile_lag0'] = (
-    df_long.groupby('QUARTER')['RRR_LAG0'].transform(safe_qcut) #same as quartile
-)
-returns = df_long.copy()
-returns = df_long.reset_index() 
-returns = returns.rename(columns={'DATE': 'Date', 'quartile_lag0': 'quartile'})
-port_rets_vw_lag0, cum_returns_vw_lag0 = calc_and_plot_portfolio_returns_from_long(
-    returns, weight_type='value', benchmarks=['SPX INDEX']
-)
-
-#LAG2
-df_long['QUARTER'] = df_long.index.get_level_values('DATE').to_period('Q')
-df_long['RRR_LAG2'] = df_long.groupby(level='FIRM')['#RRR'].shift(2)
-df_long['RRR_LAG2'] = pd.to_numeric(df_long['RRR_LAG2'], errors='coerce')
-df_long['quartile_lag2'] = (
-    df_long.groupby('QUARTER')['RRR_LAG2']
-    .transform(safe_qcut)
-)
-returns = df_long.copy()
-returns = df_long.reset_index()
-returns = returns.rename(columns={'DATE': 'Date', 'quartile_lag2': 'quartile'})
-port_rets_vw_lag2, cum_returns_vw_lag2 = calc_and_plot_portfolio_returns_from_long(
-    returns, weight_type='value', benchmarks=['SPX INDEX']
+# Aggregate to get market return
+market_ret = (
+    sample_firms.groupby('Date')['w_return']
+    .sum()
+    .sort_index()
 )
 
-#LAG3
-df_long['RRR_LAG3'] = df_long.groupby(level='FIRM')['#RRR'].shift(3)
-df_long['RRR_LAG3'] = pd.to_numeric(df_long['RRR_LAG3'], errors='coerce')
-df_long['quartile_lag3'] = (
-    df_long.groupby('QUARTER')['RRR_LAG3']
-    .transform(safe_qcut)
-)
-returns = df_long.copy()
-returns = df_long.reset_index()
-returns = returns.rename(columns={'DATE': 'Date', 'quartile_lag3': 'quartile'})
-port_rets_vw_lag3, cum_returns_vw_lag3 = calc_and_plot_portfolio_returns_from_long(
-    returns, weight_type='value', benchmarks=['SPX INDEX']
-)
+# Add to portfolio returns
+port_rets_vw['SAMPLE_VW'] = market_ret.reindex(port_rets_vw.index)
 
+# Recalculate cumulative returns with new benchmark
+cum_returns_vw_updated = np.exp(port_rets_vw.cumsum()) - 1
+first_date = cum_returns_vw_updated.index.min()
+prior_date = first_date - pd.offsets.MonthEnd(1)
+start_row = pd.DataFrame({c: 0.0 for c in cum_returns_vw_updated.columns}, index=[prior_date])
+cum_returns_vw_updated = pd.concat([start_row, cum_returns_vw_updated]).sort_index()
 
+# Plot with updated benchmark
+plt.figure(figsize=(12, 6))
+for col in cum_returns_vw_updated.columns:
+    linestyle = '--' if col in ['SPX', 'SAMPLE_VW'] else '-'
+    linewidth = 2 if col == 'SAMPLE_VW' else 1.5
+    plt.plot(cum_returns_vw_updated.index, cum_returns_vw_updated[col], 
+             label=col, linestyle=linestyle, linewidth=linewidth)
 
-#LAG4
-df_long['RRR_LAG4'] = df_long.groupby(level='FIRM')['#RRR'].shift(4)
-df_long['RRR_LAG4'] = pd.to_numeric(df_long['RRR_LAG4'], errors='coerce')
-df_long['quartile_lag4'] = (
-    df_long.groupby('QUARTER')['RRR_LAG4']
-    .transform(safe_qcut)
-)
-returns = df_long.copy()
-returns = df_long.reset_index()
-returns = returns.rename(columns={'DATE': 'Date', 'quartile_lag4': 'quartile'})
-port_rets_vw_lag3, cum_returns_vw_lag4 = calc_and_plot_portfolio_returns_from_long(
-    returns, weight_type='value', benchmarks=['SPX INDEX']
-)
+plt.title('Cumulative Returns by RRR Quartile Portfolio (Value-Weighted)')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Return (Start = 0)')
+plt.legend(title='Portfolio', loc='upper left')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
 
 
 # Analysing Growth Mix by Quartile with Time Alignment
@@ -1952,6 +2012,11 @@ port_rets_vw_lag3, cum_returns_vw_lag4 = calc_and_plot_portfolio_returns_from_lo
 # =============================================================================
 # Expanded Distribution Analysis by Quartile (RRR, Acquisition Rate, Growth Mix)
 # =============================================================================
+
+'''
+technically I also need to use N-2 fundamentals
+talk to someone about the timeframe alignment
+'''
 
 def metric_distribution_by_quartile(returns_df, metric_tag):
     """
@@ -2007,36 +2072,64 @@ print("="*80)
 print("\n--- Growth Mix Statistics by Quartile (Time-Aligned) ---")
 gm_stats = metric_distribution_by_quartile(returns, '#GROWTH_MIX')
 if gm_stats is not None:
-    print(gm_stats.round(4))
+    print(gm_stats.round(2))
 
 # RRR Distribution Statistics
 print("\n--- RRR Distribution by Quartile (Time-Aligned) ---")
 rrr_stats = metric_distribution_by_quartile(returns, 'RRR_PCT')
 if rrr_stats is not None:
-    print(rrr_stats.round(4))
+    print(rrr_stats.round(2))
 
 # Acquisition Rate Distribution Statistics
 print("\n--- Acquisition Rate Distribution by Quartile (Time-Aligned) ---")
 acq_stats = metric_distribution_by_quartile(returns, 'ACQ_RATE_PCT')
 if acq_stats is not None:
-    print(acq_stats.round(4))
+    print(acq_stats.round(2))
 
 
 # Revenue Growth Rate Distribution Statistics
 print("\n--- Revenue Growth Rate Distribution by Quartile (Time-Aligned) ---")
 rev_growth_stats = metric_distribution_by_quartile(returns, 'REV_GROWTH_PCT')
 if rev_growth_stats is not None:
-    print(rev_growth_stats.round(4))
+    print(rev_growth_stats.round(2))
 
-# Optional: Create a combined summary table
-print("\n--- Combined Summary: Mean Values by Quartile ---")
+# Size (Log Market Cap) Distribution Statistics
+print("\n--- Size (Log Market Cap) Distribution by Quartile (Time-Aligned) ---")
+size_stats = metric_distribution_by_quartile(returns, 'SIZE')
+if size_stats is not None:
+    print(size_stats.round(2))
+
+# Book-to-Market (BTM) Distribution Statistics
+print("\n--- Book-to-Market Ratio Distribution by Quartile (Time-Aligned) ---")
+btm_stats = metric_distribution_by_quartile(returns, 'BTM')
+if btm_stats is not None:
+    print(btm_stats.round(2))
+
+# Profit Margin Distribution Statistics
+print("\n--- Operating Profit Margin Distribution by Quartile (Time-Aligned) ---")
+pm_stats = metric_distribution_by_quartile(returns, 'PM_OPER_PCT')
+if pm_stats is not None:
+    print(pm_stats.round(2))
+
+# Revenue (Sales) Distribution Statistics
+print("\n--- Revenue (Sales) Distribution by Quartile (Time-Aligned) ---")
+revenue_stats = metric_distribution_by_quartile(returns, 'SALES_REV_TURN')
+if revenue_stats is not None:
+    print(revenue_stats.round(2))
+
+# Optional: Create a combined summary table with ALL metrics
+print("\n--- Combined Summary: Median Values by Quartile ---")
 combined_summary = pd.DataFrame({
-    'RRR (%)': rrr_stats['mean'] if rrr_stats is not None else np.nan,
-    'Acq Rate (%)': acq_stats['mean'] if acq_stats is not None else np.nan,
-    'Growth Mix': gm_stats['mean'] if gm_stats is not None else np.nan,
-    'Rev Growth (%)': rev_growth_stats['mean'] if rev_growth_stats is not None else np.nan
+    'RRR (%)': rrr_stats['median'] if rrr_stats is not None else np.nan,
+    'Acq Rate (%)': acq_stats['median'] if acq_stats is not None else np.nan,
+    'Growth Mix': gm_stats['median'] if gm_stats is not None else np.nan,
+    'Rev Growth (%)': rev_growth_stats['median'] if rev_growth_stats is not None else np.nan,
+    'Size (log)': size_stats['median'] if size_stats is not None else np.nan,
+    'BTM': btm_stats['median'] if btm_stats is not None else np.nan,
+    'PM (%)': pm_stats['median'] if pm_stats is not None else np.nan,
+    'Revenue (M)': revenue_stats['median'] if revenue_stats is not None else np.nan
 })
-print(combined_summary.round(4))
+print(combined_summary.round(2))
 
 
 
@@ -2047,70 +2140,99 @@ print(combined_summary.round(4))
 
 import statsmodels.api as sm
 from scipy.stats import skew, kurtosis
-def portfolio_performance_table(port_ret, benchmark_col='SPX'):
+def portfolio_performance_table(port_ret, benchmark_cols=['SPX', 'SAMPLE_VW']):
+    """
+    Calculate performance metrics for ALL columns (including benchmarks).
+    
+    Parameters:
+    -----------
+    port_ret : DataFrame with portfolio returns
+    benchmark_cols : list of benchmark column names (for reference, all get metrics)
+    """
     measures = [
         'Geometric Mean Return', 'Downside Deviation', 'Max Drawdown',
-        'Sortino Ratio', 'Skewness', 'Kurtosis', 'Alpha', 'Beta',
+        'Sortino Ratio', 'Skewness', 'Kurtosis', 
+        'Alpha (vs SPX)', 'Beta (vs SPX)',
+        'Alpha (vs SAMPLE_VW)', 'Beta (vs SAMPLE_VW)',
         'VaR 5%', 'Hit Ratio'
     ]
-    portfolios = list(port_ret.columns)
-    perf = pd.DataFrame(index=measures, columns=portfolios)
+    
+    # Include ALL columns (portfolios + benchmarks)
+    all_columns = list(port_ret.columns)
+    perf = pd.DataFrame(index=measures, columns=all_columns)
 
-    for col in portfolios:
+    for col in all_columns:
         returns = port_ret[col].dropna()
-        if benchmark_col in port_ret.columns:
-            benchmark = port_ret[benchmark_col].reindex(returns.index).dropna()
-            returns = returns.loc[benchmark.index]
-        else:
-            benchmark = None
-
+        
+        # Geometric mean
         geo_mean = np.exp(returns.mean()) - 1
+
+        # Downside deviation (negative returns only)
         downside = returns[returns < 0]
         dd = downside.std(ddof=0)
+
+        # Max drawdown
         cum = np.exp(returns.cumsum())
         cum_max = cum.cummax()
         drawdown = (cum / cum_max - 1).min()
+
+        # Sortino ratio
         sortino = returns.mean() / dd if dd > 0 else np.nan
+
+        # Skewness and kurtosis
         skewness = skew(returns, nan_policy='omit')
         kurt = kurtosis(returns, nan_policy='omit', fisher=False)
 
-        if benchmark is not None and not benchmark.isnull().all():
-            aligned = pd.concat([returns, benchmark], axis=1).dropna()
-            print(f"{col}: {len(aligned)} aligned months")
-            X = sm.add_constant(aligned[benchmark_col])
-            reg = sm.OLS(aligned[col], X).fit()
-            print(f"Params for {col}:")
-            print(reg.params)
-            try:
-                alpha = reg.params['const']
-                beta = reg.params[benchmark_col]
-            except (KeyError, IndexError):
-                # fallback to numeric index if names don't exist
-                alpha = reg.params.iloc[0]
-                beta = reg.params.iloc[1]
-        else:
-            alpha, beta = np.nan, np.nan
+        # Alpha and Beta for EACH benchmark
+        # NOTE: Benchmarks will have Alpha/Beta vs themselves = 0/1 (or vs other benchmarks)
+        alphas = {}
+        betas = {}
+        
+        for benchmark_col in benchmark_cols:
+            if benchmark_col in port_ret.columns:
+                benchmark = port_ret[benchmark_col].reindex(returns.index).dropna()
+                aligned_returns = returns.loc[benchmark.index]
+                
+                if len(aligned_returns) > 0 and not benchmark.isnull().all():
+                    X = sm.add_constant(benchmark)
+                    reg = sm.OLS(aligned_returns, X).fit()
+                    try:
+                        alphas[benchmark_col] = reg.params['const']
+                        betas[benchmark_col] = reg.params[benchmark_col]
+                    except (KeyError, IndexError):
+                        alphas[benchmark_col] = reg.params.iloc[0]
+                        betas[benchmark_col] = reg.params.iloc[1]
+                else:
+                    alphas[benchmark_col] = np.nan
+                    betas[benchmark_col] = np.nan
+            else:
+                alphas[benchmark_col] = np.nan
+                betas[benchmark_col] = np.nan
 
+        # VaR and Hit Ratio
         var5 = np.percentile(returns, 5)
         hit = (returns > 0).mean()
 
-
-
+        # Fill performance table
         perf.at['Geometric Mean Return', col] = geo_mean
         perf.at['Downside Deviation', col] = dd
         perf.at['Max Drawdown', col] = drawdown
         perf.at['Sortino Ratio', col] = sortino
         perf.at['Skewness', col] = skewness
         perf.at['Kurtosis', col] = kurt
-        perf.at['Alpha', col] = alpha
-        perf.at['Beta', col] = beta
+        perf.at['Alpha (vs SPX)', col] = alphas.get('SPX', np.nan)
+        perf.at['Beta (vs SPX)', col] = betas.get('SPX', np.nan)
+        perf.at['Alpha (vs SAMPLE_VW)', col] = alphas.get('SAMPLE_VW', np.nan)
+        perf.at['Beta (vs SAMPLE_VW)', col] = betas.get('SAMPLE_VW', np.nan)
         perf.at['VaR 5%', col] = var5
         perf.at['Hit Ratio', col] = hit
 
     return perf
 
-perf_table_vw = portfolio_performance_table(port_rets_vw, benchmark_col='SPX')
+# Update performance table with both benchmarks
+perf_table_vw = portfolio_performance_table(port_rets_vw, benchmark_cols=['SPX', 'SAMPLE_VW'])
 perf_table_vw = perf_table_vw.map(lambda x: f"{x:.4f}" if isinstance(x, (float, np.floating)) else x)
+print("\n=== Performance Table (with SPX and SAMPLE_VW Benchmarks) ===")
 print(perf_table_vw)
 
 # For equal-weighted:
@@ -2140,18 +2262,58 @@ combined.head()
 
 import statsmodels.api as sm
 
-# Choose which portfolios to analyze (exclude SPX/SPW if you want)
-portfolios = [col for col in port_rets_vw.columns if col not in ['SPX', 'SPW']]
+
+
+# Create long-short portfolio (Q4 - Q1)
+combined['Q4-Q1'] = combined['Q4'] - combined['Q1']
+
+# Choose which portfolios to analyze (include long-short)
+portfolios = [col for col in port_rets_vw.columns if col not in ['SPX', 'SPW', 'SAMPLE_VW']]
+portfolios.append('Q4-Q1')  # Add the long-short portfolio
+
+print("\n" + "="*80)
+print("FAMA-FRENCH 3-FACTOR REGRESSIONS")
+print("="*80)
+
+# Store results for comparison
+ff_results = {}
 
 for p in portfolios:
     # Excess returns (portfolio minus risk-free)
     y = combined[p] - combined['RF']
+    
     # Explanatory variables (factors)
     X = combined[['Mkt-RF', 'SMB', 'HML']]
     X = sm.add_constant(X)
-    model = sm.OLS(y, X).fit()
-    print(f'\nFama-French regression for {p}:')
+    
+    # Run regression
+    model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 3})  # Newey-West standard errors
+    
+    print(f'\n{"="*60}')
+    print(f'Fama-French Regression for {p}:')
+    print(f'{"="*60}')
     print(model.summary())
+    
+    # Store key metrics
+    ff_results[p] = {
+        'Alpha': model.params['const'],
+        'Alpha_tstat': model.tvalues['const'],
+        'Alpha_pval': model.pvalues['const'],
+        'Beta_Mkt': model.params['Mkt-RF'],
+        'Beta_SMB': model.params['SMB'],
+        'Beta_HML': model.params['HML'],
+        'R-squared': model.rsquared,
+        'Adj_R-squared': model.rsquared_adj
+    }
+
+# Create summary table of all results
+ff_summary = pd.DataFrame(ff_results).T
+print("\n" + "="*80)
+print("FAMA-FRENCH REGRESSION SUMMARY TABLE")
+print("="*80)
+print(ff_summary.round(4))
+
+
 
 '''
 neu ende
