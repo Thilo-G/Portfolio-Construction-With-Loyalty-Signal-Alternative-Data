@@ -19,6 +19,7 @@ matplotlib.use('Agg')  # Non-interactive backend for batch runs
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from scipy.stats import skew, kurtosis
+import scipy.stats as sps
 import warnings
 import os
 import io
@@ -40,6 +41,26 @@ VALID_SECTORS = ['Consumer Discretionary', 'Communication Services', 'Consumer S
 FF3_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
 FF5_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip"
 MOM_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip"
+
+# =============================================================================
+# PORTFOLIO TIMING CONVENTION (calendar-month based, NOT quarter-integer shifts)
+# =============================================================================
+# Every signal (RRR, adjusted RRR, AR, SRR, ...) is measured at a calendar
+# quarter-end date Q. The portfolio is FORMED FORM_LAG_MONTHS calendar months
+# after Q, so the revenue/RRR figure is public before we trade on it, and then
+# HELD for HOLD_MONTHS months. Returns are therefore earned in calendar months
+#   [Q + FORM_LAG_MONTHS + 1, ..., Q + FORM_LAG_MONTHS + HOLD_MONTHS].
+#   Example: Q = 3/31  ->  form at end of May  ->  hold Jun, Jul, Aug.
+#
+# CRITICAL: the lag lives ONLY in this formation gap. Signals are used
+# CONTEMPORANEOUSLY (measured at Q), never additionally .shift()-ed, so that a
+# second implicit quarter-lag is never stacked on top of the formation gap.
+# The identical convention is applied to the RRR sorts, the value-weighted
+# market portfolio, the Fama-MacBeth regression, and the alternative-metric
+# sorts, all through build_holding_panel().
+FORM_LAG_MONTHS = 2      # calendar months from quarter-end Q to the formation date
+HOLD_MONTHS = 3          # holding-period length in months
+EXPECTED_N_FIRMS = 124   # sample-size invariant, asserted at portfolio formation
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -698,24 +719,31 @@ def phase1c_load_monthly_returns():
         if c != 'Date':
             df_prices[c] = pd.to_numeric(df_prices[c], errors='coerce')
 
-    # Monthly log returns
+    # Monthly log returns, simple returns, AND the price level.
+    # The price level is retained so that market cap can later be measured as of
+    # the formation date (quarter-end market cap scaled by the firm's own price
+    # change), rather than using the stale quarter-end market cap.
     px_only = df_prices.drop(columns=['Date'])
-    returns_px = np.log(px_only / px_only.shift(1))
-    returns_px['Date'] = df_prices['Date'].values
+    log_ret = np.log(px_only / px_only.shift(1))
 
-    returns = returns_px.melt(id_vars='Date', var_name='FirmVar', value_name='RETURN_LOG')
-    returns = returns.dropna(subset=['RETURN_LOG'])
+    px_long = px_only.copy()
+    px_long['Date'] = df_prices['Date'].values
+    px_long = px_long.melt(id_vars='Date', var_name='FirmVar', value_name='PX')
+
+    log_ret['Date'] = df_prices['Date'].values
+    ret_long = log_ret.melt(id_vars='Date', var_name='FirmVar', value_name='RETURN_LOG')
+
+    returns = ret_long.merge(px_long, on=['Date', 'FirmVar'], how='left')
     returns['FIRM'] = returns['FirmVar'].str.replace('.PX_LAST', '', regex=False).str.upper()
     returns.drop(columns=['FirmVar'], inplace=True)
+    returns = returns.dropna(subset=['RETURN_LOG'])
+    # Simple (arithmetic) monthly return; portfolios are value-weighted from these,
+    # NOT from log returns (a value-weighted mean of log returns is biased).
+    returns['RET_SIMPLE'] = np.exp(returns['RETURN_LOG']) - 1
 
-    # Quarter assignment: shift back 1 quarter (use Q4 2019 RRR for Jan-Mar 2020)
-    returns['QUARTER'] = (
-        returns['Date']
-        .dt.to_period('Q')
-        .apply(lambda x: x - 1)
-        .dt.to_timestamp('Q', 'end')
-    )
-
+    # NOTE: no quarter lag is baked in here. All signal->return timing (the
+    # 2-month formation gap and 3-month hold) is applied once, in
+    # build_holding_panel(), to avoid stacking a second implicit lag.
     print(f"  Monthly returns: {len(returns)} obs, {returns['FIRM'].nunique()} firms")
     print(f"  Date range: {returns['Date'].min()} to {returns['Date'].max()}")
 
@@ -741,19 +769,25 @@ def phase2_empirical(df_filtered, returns, ff_factors):
 
     # --- 2.2-2.3 Portfolio sorts ---
     print("\n--- 2.2-2.3 Portfolio sorts ---")
-    # Merge quarterly signals onto monthly returns
-    returns_merged = merge_signals_to_returns(df_filtered, returns)
+    # Build the holding panel once (k=FORM_LAG_MONTHS formation gap, HOLD_MONTHS hold),
+    # then reuse it for the sorts, the CAPM check, Fama-MacBeth, and risk analysis so
+    # every test shares the identical signal->return timing convention.
+    panel = build_holding_panel(df_filtered, returns)
+    results['panel'] = panel
+    results['portfolios'] = run_portfolio_analysis(panel, ff_factors)
 
-    # Build portfolios and run factor regressions
-    results['portfolios'] = run_portfolio_analysis(returns_merged, ff_factors)
+    # --- 2.4 CAPM: sample value-weighted market vs S&P 500 ---
+    print("\n--- 2.4 CAPM: sample market portfolio vs S&P 500 ---")
+    results['capm_sp500'] = run_capm_vs_sp500(
+        results['portfolios'].get('market_ret'), returns, ff_factors)
 
-    # --- 2.5 Fama-MacBeth ---
+    # --- 2.5 Fama-MacBeth (same timing as the sorts) ---
     print("\n--- 2.5 Fama-MacBeth regressions ---")
-    results['fama_macbeth'] = run_fama_macbeth(df_filtered)
+    results['fama_macbeth'] = run_fama_macbeth(panel, ff_factors)
 
     # --- 2.6 Risk analysis ---
     print("\n--- 2.6 Risk analysis ---")
-    results['risk'] = run_risk_analysis(returns_merged, ff_factors)
+    results['risk'] = run_risk_analysis(panel, ff_factors)
 
     return results
 
@@ -816,59 +850,161 @@ def test_signal_persistence(df_filtered):
     return persistence_results
 
 
-def merge_signals_to_returns(df_filtered, returns):
-    """Merge quarterly signals onto monthly returns data."""
+def build_holding_panel(df_filtered, returns,
+                        form_lag=FORM_LAG_MONTHS, hold=HOLD_MONTHS):
+    """Map each quarter-end signal to the monthly returns it is meant to predict.
 
-    print("\n  Merging quarterly signals onto monthly returns...")
+    Timing convention (see FORM_LAG_MONTHS / HOLD_MONTHS at the top of the file):
+      * the signal is measured at quarter-end Q and used CONTEMPORANEOUSLY
+        (no additional .shift()); the lag is provided ENTIRELY by forming the
+        portfolio ``form_lag`` calendar months after Q;
+      * formation month period = Q_month + form_lag;
+      * holding month periods    = Q_month + form_lag + 1 ... Q_month + form_lag + hold.
+    Example (form_lag=2, hold=3): Q = 3/31 -> form end of May -> hold Jun, Jul, Aug.
 
-    # Prepare quarterly signal data
-    df_q = df_filtered.reset_index()[[
-        'FIRM', 'DATE', 'RRR_LAG', 'RRR_PCT_LAG1', 'ACQ_RATE_PCT_LAG1',
-        'ADJ_RRR_PCT_LAG1', 'ADJ_ACQ_RATE_PCT_LAG1',
-        'HISTORICAL_MARKET_CAP', 'SIZE', 'BTM', 'PM_OPER_PCT',
-        'SECTOR', 'REV_GROWTH_PCT'
-    ]].copy()
-    df_q['DATE'] = pd.to_datetime(df_q['DATE'])
-    df_q['QUARTER'] = df_q['DATE'].dt.to_period('Q').dt.to_timestamp('Q', 'end')
-    df_q['FIRM'] = df_q['FIRM'].str.upper()
+    Market cap is measured as of the FORMATION month: the quarter-end market cap
+    is scaled by the firm's own monthly price change from the quarter-end month to
+    the formation month (using the monthly price series, so splits are handled
+    consistently). This replaces the stale quarter-end market cap for weighting.
 
-    # Merge
+    Returns one row per (firm, holding-month):
+        FIRM, Date (holding-month date, as in the monthly-return file),
+        QUARTER (= Q, the signal's calendar quarter-end), FORMATION_DATE,
+        HOLD_IDX (1..hold), RET_SIMPLE, RETURN_LOG, MCAP_FORM (formation market cap),
+        and the contemporaneous quarter-end signals/controls.
+    """
+    print(f"\n  Building holding panel (form {form_lag}m after quarter-end, hold {hold}m)...")
+
+    # ---- 1. Quarter-end signals (CONTEMPORANEOUS, measured at Q) ----
+    base_cols = ['RRR_PCT', 'ADJ_RRR_PCT', 'ACQ_RATE_PCT', 'ADJ_ACQ_RATE_PCT',
+                 'REV_GROWTH_PCT', 'SIZE', 'BTM', 'PM_OPER_PCT', 'SECTOR',
+                 'HISTORICAL_MARKET_CAP', 'PX_LAST']
+    alt_cols = ['ADJ_SRR_PCT', 'SRR_PCT', 'ADJ_LR_RRR_PCT', 'LR_RRR_PCT',
+                'ADJ_CUMRR_PCT', 'CUMRR_PCT']
+    sig_cols = [c for c in base_cols + alt_cols if c in df_filtered.columns]
+
+    q = df_filtered.reset_index()[['FIRM', 'DATE'] + sig_cols].copy()
+    q['FIRM'] = q['FIRM'].str.upper()
+    q['DATE'] = pd.to_datetime(q['DATE'])
+    # Verify the quarter-end labels are uniform calendar quarters (3/6/9/12).
+    bad_months = sorted(set(q['DATE'].dt.month.unique()) - {3, 6, 9, 12})
+    assert not bad_months, f"Non-calendar-quarter signal dates found (months {bad_months})."
+    q['QUARTER'] = q['DATE'].dt.to_period('Q').dt.to_timestamp('Q', 'end')  # calendar quarter-end
+    q['Q_MONTH'] = q['DATE'].dt.to_period('M')                              # month of the quarter-end
+    q['FORM_MONTH'] = q['Q_MONTH'] + form_lag                               # formation month period
+    q['FORMATION_DATE'] = q['FORM_MONTH'].dt.to_timestamp('M')
+
+    # ---- 2. Monthly price panel keyed by (FIRM, month-period) ----
     ret = returns.copy()
     ret['FIRM'] = ret['FIRM'].str.upper()
-    ret = ret.merge(df_q.drop(columns=['DATE']), on=['FIRM', 'QUARTER'], how='inner')
+    ret['MONTH'] = ret['Date'].dt.to_period('M')
+    px_df = ret[['FIRM', 'MONTH', 'PX']].dropna().drop_duplicates(['FIRM', 'MONTH'])
 
-    # Filter to only firms in our sector-filtered sample
-    valid_firms = df_filtered.index.get_level_values('FIRM').unique()
-    ret = ret[ret['FIRM'].isin(valid_firms)]
+    # ---- 3. Formation-date market cap = quarter-end MCAP * (PX_form / PX_Q) ----
+    q = q.merge(px_df.rename(columns={'MONTH': 'Q_MONTH', 'PX': 'PX_Q_MON'}),
+                on=['FIRM', 'Q_MONTH'], how='left')
+    q = q.merge(px_df.rename(columns={'MONTH': 'FORM_MONTH', 'PX': 'PX_FORM_MON'}),
+                on=['FIRM', 'FORM_MONTH'], how='left')
+    q['MCAP_Q'] = pd.to_numeric(q['HISTORICAL_MARKET_CAP'], errors='coerce')
+    q['MCAP_FORM'] = q['MCAP_Q'] * (q['PX_FORM_MON'] / q['PX_Q_MON'])
+    # If the formation-month price is missing, fall back to the quarter-end MCAP.
+    q['MCAP_FORM'] = q['MCAP_FORM'].where(q['MCAP_FORM'].notna(), q['MCAP_Q'])
 
-    print(f"  Merged: {len(ret)} monthly obs, {ret['FIRM'].nunique()} firms")
+    # ---- 4. Expand each firm-quarter to its `hold` holding months ----
+    frames = []
+    for h in range(1, hold + 1):
+        qh = q.copy()
+        qh['MONTH'] = qh['Q_MONTH'] + form_lag + h  # holding-month period
+        qh['HOLD_IDX'] = h
+        frames.append(qh)
+    holding = pd.concat(frames, ignore_index=True)
 
-    return ret
+    # ---- 5. Attach the monthly return earned in each holding month ----
+    ret_small = ret[['FIRM', 'MONTH', 'Date', 'RET_SIMPLE', 'RETURN_LOG']].copy()
+    panel = holding.merge(ret_small, on=['FIRM', 'MONTH'], how='inner')
+
+    # Restrict to the sector-filtered sample (indices are already excluded there).
+    valid_firms = set(s.upper() for s in df_filtered.index.get_level_values('FIRM'))
+    panel = panel[panel['FIRM'].isin(valid_firms)].copy()
+
+    # Drop the raw quarter-end 'DATE' (redundant with the normalized 'QUARTER')
+    # to avoid confusion with the monthly-return 'Date' column.
+    panel = panel.drop(columns=['DATE', 'Q_MONTH', 'FORM_MONTH', 'MONTH',
+                                'PX_Q_MON', 'PX_FORM_MON'])
+    print(f"  Holding panel: {len(panel)} firm-months, {panel['FIRM'].nunique()} firms, "
+          f"{panel['QUARTER'].nunique()} signal quarters")
+    return panel
 
 
-def run_portfolio_analysis(returns_merged, ff_factors):
-    """Run single and double portfolio sorts with factor regressions.
+def merge_signals_to_returns(df_filtered, returns, **kwargs):
+    """Backward-compatible alias for build_holding_panel (import-compat)."""
+    return build_holding_panel(df_filtered, returns, **kwargs)
 
-    Output order:
-      1. Univariate quartile sorts (Q1=highest): raw RRR, raw AR, adj RRR, adj AR
-      2. Univariate tercile sorts (T1=highest): raw RRR, raw AR, adj RRR, adj AR
-      3. Bivariate 3x3 double sorts: RAW then ADJ
+
+def value_weighted_market(panel):
+    """Value-weighted SIMPLE market return of all sample firms, using
+    formation-date market cap as the weight (same convention as the sorts)."""
+    df = panel.dropna(subset=['MCAP_FORM', 'RET_SIMPLE']).copy()
+    df['MCAP_FORM'] = pd.to_numeric(df['MCAP_FORM'], errors='coerce')
+    df = df.dropna(subset=['MCAP_FORM'])
+    df['w'] = df['MCAP_FORM'] / df.groupby('Date')['MCAP_FORM'].transform('sum')
+    df['wr'] = df['w'] * df['RET_SIMPLE']
+    return df.groupby('Date')['wr'].sum().sort_index()
+
+
+def echo_formation_examples(panel, n_generic=2):
+    """Log the exact formation date and holding window for a few firm-quarters,
+    so the timing convention is spot-checkable later without re-deriving it."""
+    print("\n  [ECHO] example formation dates / 3-month holding windows "
+          "(signal at quarter-end -> months actually held):")
+    ex = (panel.dropna(subset=['ADJ_RRR_PCT'])
+                .sort_values(['FIRM', 'QUARTER', 'HOLD_IDX']))
+    # Prefer the two firm-quarters used in the written hand-trace, then fill generically.
+    preferred = [('FIVE US EQUITY', '2019Q3'), ('FIVE US EQUITY', '2020Q1')]
+    seen = []
+    for firm, qlabel in preferred:
+        g = ex[(ex['FIRM'] == firm) &
+               (ex['QUARTER'].dt.to_period('Q').astype(str) == qlabel)]
+        if len(g) == HOLD_MONTHS:
+            seen.append((firm, g['QUARTER'].iloc[0], g))
+    for (firm, qtr), g in ex.groupby(['FIRM', 'QUARTER']):
+        if len(seen) >= len(preferred) + n_generic:
+            break
+        if len(g) == HOLD_MONTHS and not any(s[0] == firm and s[1] == qtr for s in seen):
+            seen.append((firm, qtr, g))
+    for firm, qtr, g in seen:
+        months = ', '.join(pd.to_datetime(g['Date']).dt.strftime('%Y-%m'))
+        print(f"    {firm:<16} signal Q-end {pd.Timestamp(qtr).strftime('%Y-%m-%d')} "
+              f"(ADJ_RRR={g['ADJ_RRR_PCT'].iloc[0]:7.2f}) -> "
+              f"form {pd.Timestamp(g['FORMATION_DATE'].iloc[0]).strftime('%Y-%m-%d')} -> "
+              f"hold [{months}]  MCAP_form={g['MCAP_FORM'].iloc[0]:,.0f}M")
+
+
+def run_portfolio_analysis(panel, ff_factors):
+    """Univariate RRR quartile sorts (Q1 = highest RRR) with factor regressions.
+
+    Consumes the holding panel from build_holding_panel(), so the signal->return
+    timing (form FORM_LAG_MONTHS months after quarter-end, hold HOLD_MONTHS) is
+    already correct. Sorts use the CONTEMPORANEOUS quarter-end signal (RRR_PCT /
+    ADJ_RRR_PCT), never a re-lagged column, so no second lag is stacked.
     """
 
     results = {}
-    ret = returns_merged.copy()
-
-    # Ensure numeric signal columns
-    for col in ['RRR_PCT_LAG1', 'ACQ_RATE_PCT_LAG1', 'ADJ_RRR_PCT_LAG1', 'ADJ_ACQ_RATE_PCT_LAG1', 'HISTORICAL_MARKET_CAP']:
+    ret = panel.copy()
+    for col in ['RRR_PCT', 'ADJ_RRR_PCT', 'MCAP_FORM']:
         ret[col] = pd.to_numeric(ret[col], errors='coerce')
 
-    # Market portfolio: VW return of all sample firms
-    ret_sample = ret[~ret['FIRM'].isin(['SPX INDEX', 'SPW INDEX', 'USBMMY3M INDEX'])].copy()
-    ret_sample['MCAP'] = ret_sample['HISTORICAL_MARKET_CAP']
-    ret_sample['MCAP_TOTAL'] = ret_sample.groupby('Date')['MCAP'].transform('sum')
-    ret_sample['w_mkt'] = ret_sample['MCAP'] / ret_sample['MCAP_TOTAL']
-    ret_sample['w_ret_mkt'] = ret_sample['w_mkt'] * ret_sample['RETURN_LOG']
-    market_ret = ret_sample.groupby('Date')['w_ret_mkt'].sum().sort_index()
+    # ---- Pipeline invariants, asserted at the point portfolios are formed ----
+    n_firms = ret['FIRM'].nunique()
+    print(f"\n  [INVARIANT] firms entering portfolio formation: {n_firms} "
+          f"(expected {EXPECTED_N_FIRMS})")
+    assert n_firms == EXPECTED_N_FIRMS, (
+        f"Sample size changed: {n_firms} firms at formation, expected {EXPECTED_N_FIRMS}. "
+        f"Investigate before trusting portfolio results.")
+    echo_formation_examples(ret)
+
+    # Market portfolio: VW (formation market cap) SIMPLE return of all sample firms.
+    market_ret = value_weighted_market(ret)
 
     # =========================================================================
     # SECTION 1: UNIVARIATE QUARTILE SORTS (Q1 = highest value)
@@ -876,12 +1012,12 @@ def run_portfolio_analysis(returns_merged, ff_factors):
     print("\n  *** SECTION 1: UNIVARIATE QUARTILE SORTS (Q1=best) ***")
 
     for signal_label, rrr_col in [
-        ('RAW', 'RRR_PCT_LAG1'),
-        ('ADJ', 'ADJ_RRR_PCT_LAG1'),
+        ('RAW', 'RRR_PCT'),
+        ('ADJ', 'ADJ_RRR_PCT'),
     ]:
         print(f"\n  === {signal_label} signal — quartile sort ===")
 
-        # Univariate RRR quartile sort
+        # Univariate RRR quartile sort on the CONTEMPORANEOUS quarter-end signal
         print(f"\n  Univariate RRR quartile ({signal_label}):")
         ret[f'RRR_Q_{signal_label}'] = ret.groupby('QUARTER')[rrr_col].transform(safe_quartile)
         port_rrr_q = build_portfolio_returns(ret, f'RRR_Q_{signal_label}', market_ret)
@@ -889,28 +1025,37 @@ def run_portfolio_analysis(returns_merged, ff_factors):
             results[f'port_rrr_{signal_label.lower()}_q4_vw'] = port_rrr_q
             run_factor_regressions(port_rrr_q, ff_factors, f'RRR {signal_label} Q4 VW')
 
+    results['market_ret'] = market_ret
     return results
 
 
-def build_portfolio_returns(ret, tercile_col, market_ret):
-    """Build VW tercile portfolio returns + long-short + market."""
+def build_portfolio_returns(ret, bucket_col, market_ret):
+    """Value-weighted SIMPLE-return portfolios per bucket + long-short + market.
 
-    df = ret.dropna(subset=[tercile_col]).copy()
-    df['MCAP'] = pd.to_numeric(df['HISTORICAL_MARKET_CAP'], errors='coerce')
+    Returns are value-weighted from SIMPLE (arithmetic) monthly returns and the
+    weights use the FORMATION-date market cap (MCAP_FORM). A value-weighted mean
+    of LOG returns is biased (it is not the log of the value-weighted gross
+    return), so it is deliberately not used anywhere here.
+    """
+
+    df = ret.dropna(subset=[bucket_col]).copy()
+    df['MCAP_FORM'] = pd.to_numeric(df['MCAP_FORM'], errors='coerce')
+    df['RET_SIMPLE'] = pd.to_numeric(df['RET_SIMPLE'], errors='coerce')
+    df = df.dropna(subset=['MCAP_FORM', 'RET_SIMPLE'])
 
     if df.empty:
         print("    No valid data for portfolio construction")
         return None
 
-    # Value-weighted returns per tercile
-    df['MCAP_SUM'] = df.groupby(['Date', tercile_col])['MCAP'].transform('sum')
-    df['w'] = df['MCAP'] / df['MCAP_SUM']
-    df['w_return'] = df['w'] * df['RETURN_LOG']
+    # Value weights within each (month, bucket) from formation-date market cap,
+    # then value-weight the SIMPLE returns and sum.
+    df['w'] = df['MCAP_FORM'] / df.groupby(['Date', bucket_col])['MCAP_FORM'].transform('sum')
+    df['w_ret'] = df['w'] * df['RET_SIMPLE']
 
     port = (
-        df.groupby(['Date', tercile_col])['w_return']
+        df.groupby(['Date', bucket_col])['w_ret']
         .sum()
-        .unstack(tercile_col)
+        .unstack(bucket_col)
         .sort_index()
     )
 
@@ -920,20 +1065,20 @@ def build_portfolio_returns(ret, tercile_col, market_ret):
     elif 'T1' in port.columns and 'T3' in port.columns:
         port['T1-T3'] = port['T1'] - port['T3']
 
-    # Add market portfolio
+    # Add market portfolio (already a VW simple return)
     port['MKT'] = market_ret.reindex(port.index)
 
-    # Print summary returns
-    print(f"    Portfolio monthly log returns (annualized):")
+    # Print summary returns (simple returns; annualized as mean x 12)
+    print(f"    Portfolio monthly SIMPLE returns (annualized, mean x 12):")
     for col in port.columns:
         ann_ret = port[col].mean() * 12
         ann_vol = port[col].std() * np.sqrt(12)
         sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
         print(f"      {col}: ret={ann_ret*100:.2f}%, vol={ann_vol*100:.2f}%, SR={sharpe:.2f}")
 
-    # Firms per tercile per quarter
-    counts = df.groupby(['QUARTER', tercile_col])['FIRM'].nunique().unstack(tercile_col)
-    print(f"    Avg firms per tercile: {counts.mean().to_dict()}")
+    # Firms per bucket per quarter
+    counts = df.groupby(['QUARTER', bucket_col])['FIRM'].nunique().unstack(bucket_col)
+    print(f"    Avg firms per bucket: {counts.mean().round(1).to_dict()}")
 
     return port
 
@@ -1029,52 +1174,130 @@ def run_factor_regressions(port_rets, ff_factors, label):
     return results
 
 
-def run_fama_macbeth(df_filtered):
-    """Run Fama-MacBeth cross-sectional regressions."""
+def run_capm_vs_sp500(market_ret, returns, ff_factors):
+    """CAPM OLS of the sample's value-weighted market portfolio on the S&P 500.
+
+        (market_excess)_t = alpha + beta * (SP500_excess)_t + e_t
+
+    Monthly SIMPLE returns; risk-free = Ken French RF. Reports alpha (monthly and
+    annualized), beta, R^2, and Newey-West (HAC) t-stats. This is the real OLS
+    version of the correlation / tracking-error check that previously lived in
+    diagnose_portfolio_overlap.py (CHECK 7), moved here so it runs with everything
+    else.
+    """
+    if market_ret is None or len(market_ret) == 0:
+        print("  No sample market return available; skipping CAPM.")
+        return {}
+
+    spx = returns[returns['FIRM'] == 'SPX INDEX'][['Date', 'RET_SIMPLE']].copy()
+    if spx.empty:
+        print("  SPX INDEX not found in returns; skipping CAPM.")
+        return {}
+    spx = spx.rename(columns={'RET_SIMPLE': 'SPX'}).set_index('Date').sort_index()
+
+    df = market_ret.to_frame('MKT').join(spx, how='inner').dropna()
+    df.index = pd.to_datetime(df.index).to_period('M').to_timestamp('M')
+    rf = ff_factors['RF'].reindex(df.index)
+    df['MKT_EX'] = df['MKT'] - rf
+    df['SPX_EX'] = df['SPX'] - rf
+    df = df.dropna(subset=['MKT_EX', 'SPX_EX'])
+    if len(df) < 12:
+        print(f"  Only {len(df)} overlapping months; skipping CAPM.")
+        return {}
+
+    model = sm.OLS(df['MKT_EX'], sm.add_constant(df['SPX_EX'])).fit(
+        cov_type='HAC', cov_kwds={'maxlags': 4})
+    out = {
+        'alpha_month': model.params['const'],
+        'alpha_ann': model.params['const'] * 12,
+        'alpha_se': model.bse['const'],
+        'alpha_t': model.tvalues['const'],
+        'alpha_p': model.pvalues['const'],
+        'beta': model.params['SPX_EX'],
+        'beta_se': model.bse['SPX_EX'],
+        'beta_t': model.tvalues['SPX_EX'],
+        'r2': model.rsquared,
+        'n_obs': int(model.nobs),
+    }
+    print(f"  CAPM (sample VW market vs S&P 500), N={out['n_obs']} months:")
+    print(f"    alpha = {out['alpha_month']*100:.4f}%/mo ({out['alpha_ann']*100:.2f}%/yr), "
+          f"SE={out['alpha_se']*100:.4f}, t={out['alpha_t']:.2f}, p=[{out['alpha_p']:.3f}]")
+    print(f"    beta  = {out['beta']:.4f}  (SE={out['beta_se']:.4f}, t={out['beta_t']:.2f})")
+    print(f"    R^2   = {out['r2']:.4f}")
+    pd.DataFrame([out]).to_excel(os.path.join(OUTPUT_DIR, 'capm_vs_sp500.xlsx'), index=False)
+    return out
+
+
+def run_fama_macbeth(panel, ff_factors):
+    """Quarterly Fama-MacBeth on the SAME holding window as the portfolio sorts.
+
+    For each (firm, signal quarter Q), the dependent variable is the compounded
+    HOLD_MONTHS-month holding-period EXCESS return earned over exactly the months
+    the sort holds (formed FORM_LAG_MONTHS months after Q). Each quarter, a
+    cross-sectional OLS regresses that holding return on the CONTEMPORANEOUS
+    quarter-end signal(s) and controls; the quarterly slopes are then averaged with
+    Newey-West t-stats. Timing is therefore IDENTICAL to the sorts (2-month
+    formation gap, 3-month hold): no additional lag is applied, and the quarterly
+    structure of the original FM table is preserved. No significance stars are
+    printed; exact p-values are reported in brackets.
+
+    NOTE: this timing correction materially changes the FM result. Under the old
+    0-month-gap design (signal at Q -> next calendar quarter, overlapping the
+    earnings-announcement window) Adj RRR had t ~ 2.9-3.1; under the correct
+    2-month publication gap the cross-sectional linear effect is t ~ 1.8-1.9
+    (a monthly FM on the same panel is weaker still, t ~ 0.9-1.1). The
+    value-weighted, tail-driven portfolio long-short remains significant; the
+    equal-weighted linear FM does not clear t = 2.
+    """
 
     results = {}
+    df = panel.copy()
 
-    df = df_filtered.reset_index().copy()
-    df['DATE'] = pd.to_datetime(df['DATE'])
+    # Monthly risk-free (Ken French, simple) aligned to each holding month.
+    rf = ff_factors['RF'].copy()
+    rf.index = pd.to_datetime(rf.index).to_period('M')
+    df['MONTH_P'] = pd.to_datetime(df['Date']).dt.to_period('M')
+    df['RF_M'] = df['MONTH_P'].map(rf)
+    df['RET_SIMPLE'] = pd.to_numeric(df['RET_SIMPLE'], errors='coerce')
+    for c in ['ADJ_RRR_PCT', 'RRR_PCT', 'SIZE', 'BTM', 'PM_OPER_PCT']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # Lead excess return (next quarter)
-    df['EXCESS_RET_LEAD'] = df.groupby('FIRM')['EXCESS_RET'].shift(-1)
-    df['RET_ARITH_LEAD'] = df.groupby('FIRM')['RET_ARITH'].shift(-1)
+    # Compound each firm's HOLD_MONTHS-month holding window into ONE excess return.
+    # Controls are the quarter-end (contemporaneous) values, known by formation.
+    hw = (df.sort_values(['FIRM', 'QUARTER', 'HOLD_IDX'])
+            .groupby(['FIRM', 'QUARTER'])
+            .agg(n=('RET_SIMPLE', 'size'),
+                 gross=('RET_SIMPLE', lambda s: (1 + s).prod()),
+                 gross_rf=('RF_M', lambda s: (1 + s).prod()),
+                 ADJ_RRR_PCT=('ADJ_RRR_PCT', 'first'),
+                 RRR_PCT=('RRR_PCT', 'first'),
+                 SIZE=('SIZE', 'first'),
+                 BTM=('BTM', 'first'),
+                 PM_OPER_PCT=('PM_OPER_PCT', 'first'))
+            .reset_index())
+    # Require the full holding window so the return horizon is well defined.
+    hw = hw[hw['n'] == HOLD_MONTHS].copy()
+    hw['EXCESS_RET_HW'] = hw['gross'] - hw['gross_rf']
 
-    # Control variables: lagged values
-    df['SIZE_LAG'] = df.groupby('FIRM')['SIZE'].shift(1)
-    df['BTM_LAG'] = df.groupby('FIRM')['BTM'].shift(1)
-    df['PM_LAG'] = df.groupby('FIRM')['PM_OPER_PCT'].shift(1)
-
-    # Momentum (use past return as proxy)
-    df['RET_LAG'] = df.groupby('FIRM')['RET_ARITH'].shift(1)
-
-    # Define specifications (RRR-only; 4 specs)
     specs = {
-        '(1) Adj RRR only': ['ADJ_RRR_PCT'],
-        '(2) Adj RRR + Controls': ['ADJ_RRR_PCT', 'SIZE_LAG', 'BTM_LAG', 'PM_LAG'],
-        '(3) Raw RRR only': ['RRR_PCT'],
-        '(4) Raw RRR + Controls': ['RRR_PCT', 'SIZE_LAG', 'BTM_LAG', 'PM_LAG'],
+        '(1) Adj RRR only':       ['ADJ_RRR_PCT'],
+        '(2) Adj RRR + Controls': ['ADJ_RRR_PCT', 'SIZE', 'BTM', 'PM_OPER_PCT'],
+        '(3) Raw RRR only':       ['RRR_PCT'],
+        '(4) Raw RRR + Controls': ['RRR_PCT', 'SIZE', 'BTM', 'PM_OPER_PCT'],
     }
-
-    y_var = 'EXCESS_RET_LEAD'
+    y_var = 'EXCESS_RET_HW'
 
     for spec_name, x_vars in specs.items():
-        # Cross-sectional regression each period
+        # Cross-sectional regression each signal quarter
         period_coefs = []
-
-        for date, group in df.groupby('DATE'):
+        for qtr, group in hw.groupby('QUARTER'):
             sub = group[[y_var] + x_vars].dropna()
             if len(sub) < 10:
                 continue
-
-            y = sub[y_var]
-            X = sm.add_constant(sub[x_vars])
-
             try:
-                model = sm.OLS(y, X).fit()
+                model = sm.OLS(sub[y_var], sm.add_constant(sub[x_vars])).fit()
                 coefs = model.params.to_dict()
-                coefs['DATE'] = date
+                coefs['QUARTER'] = qtr
                 coefs['N'] = len(sub)
                 period_coefs.append(coefs)
             except Exception:
@@ -1086,38 +1309,35 @@ def run_fama_macbeth(df_filtered):
 
         coef_df = pd.DataFrame(period_coefs)
 
-        # Time-series average with Newey-West t-stats
+        # Time-series average with Newey-West t-stats (Bartlett kernel)
         T = len(coef_df)
-        avg_coefs = coef_df.drop(columns=['DATE', 'N']).mean()
-
-        # Newey-West standard errors (Bartlett kernel)
+        avg_coefs = coef_df.drop(columns=['QUARTER', 'N']).mean()
         max_lag = max(1, int(np.floor(4 * (T/100)**(2/9))))
         se_nw = {}
         for var in avg_coefs.index:
             series = coef_df[var] - avg_coefs[var]
-            gamma0 = (series**2).mean()
-            gamma_sum = gamma0
+            gamma_sum = (series**2).mean()
             for j in range(1, max_lag + 1):
                 gamma_j = (series.iloc[j:].values * series.iloc[:-j].values).mean()
                 gamma_sum += 2 * (1 - j/(max_lag+1)) * gamma_j
             se_nw[var] = np.sqrt(gamma_sum / T)
 
-        t_stats = {var: avg_coefs[var] / se_nw[var] if se_nw[var] > 0 else np.nan for var in avg_coefs.index}
+        t_stats = {v: (avg_coefs[v] / se_nw[v] if se_nw[v] > 0 else np.nan)
+                   for v in avg_coefs.index}
+        p_values = {v: float(2 * sps.t.sf(abs(t_stats[v]), max(T - 1, 1)))
+                    if np.isfinite(t_stats[v]) else np.nan for v in avg_coefs.index}
 
-        print(f"\n  {spec_name} (T={T}, avg N={coef_df['N'].mean():.0f}):")
+        print(f"\n  {spec_name} (T={T} quarters, avg N={coef_df['N'].mean():.0f}):")
         for var in [v for v in avg_coefs.index if v != 'const']:
-            stars = ''
-            t = abs(t_stats[var])
-            if t > 2.576: stars = '***'
-            elif t > 1.96: stars = '**'
-            elif t > 1.645: stars = '*'
-            print(f"    {var:<25} coef={avg_coefs[var]:>10.4f}  t={t_stats[var]:>7.2f}{stars}")
+            print(f"    {var:<25} coef={avg_coefs[var]:>10.4f}  "
+                  f"t={t_stats[var]:>7.2f}  p=[{p_values[var]:.3f}]")
 
         results[spec_name] = {
             'avg_coefs': avg_coefs.to_dict(),
             't_stats': t_stats,
+            'p_values': p_values,
             'T': T,
-            'avg_N': coef_df['N'].mean()
+            'avg_N': coef_df['N'].mean(),
         }
 
     # Export
@@ -1131,8 +1351,9 @@ def run_fama_macbeth(df_filtered):
                 'Variable': var,
                 'Coefficient': res['avg_coefs'][var],
                 't-stat': res['t_stats'][var],
+                'p-value': res['p_values'][var],
                 'T': res['T'],
-                'Avg N': res['avg_N']
+                'Avg N': res['avg_N'],
             })
 
     fm_df = pd.DataFrame(fm_summary)
@@ -1142,26 +1363,32 @@ def run_fama_macbeth(df_filtered):
     return results
 
 
-def run_risk_analysis(returns_merged, ff_factors):
-    """Analyze risk characteristics by portfolio tercile."""
+def run_risk_analysis(panel, ff_factors):
+    """Analyze risk characteristics by adj-RRR tercile (T1 = highest RRR).
 
-    print("\n  Risk analysis by RRR and AR terciles:")
+    Uses the holding panel (same timing as the sorts). Portfolio returns are
+    value-weighted SIMPLE returns with formation-date market cap; the wealth
+    index is built by compounding simple returns, not exponentiating summed logs.
+    """
 
-    ret = returns_merged.copy()
-    ret['ADJ_RRR_PCT_LAG1'] = pd.to_numeric(ret['ADJ_RRR_PCT_LAG1'], errors='coerce')
-    ret['RRR_T'] = ret.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_tercile)
+    print("\n  Risk analysis by RRR terciles:")
+
+    ret = panel.copy()
+    ret['ADJ_RRR_PCT'] = pd.to_numeric(ret['ADJ_RRR_PCT'], errors='coerce')
+    ret['RRR_T'] = ret.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_tercile)
 
     results = {}
 
-    # Build VW portfolio returns by RRR tercile
+    # Build VW (formation market cap) SIMPLE-return portfolios by RRR tercile
     df = ret.dropna(subset=['RRR_T']).copy()
-    df['MCAP'] = pd.to_numeric(df['HISTORICAL_MARKET_CAP'], errors='coerce')
-    df['MCAP_SUM'] = df.groupby(['Date', 'RRR_T'])['MCAP'].transform('sum')
-    df['w'] = df['MCAP'] / df['MCAP_SUM']
-    df['w_return'] = df['w'] * df['RETURN_LOG']
+    df['MCAP_FORM'] = pd.to_numeric(df['MCAP_FORM'], errors='coerce')
+    df['RET_SIMPLE'] = pd.to_numeric(df['RET_SIMPLE'], errors='coerce')
+    df = df.dropna(subset=['MCAP_FORM', 'RET_SIMPLE'])
+    df['w'] = df['MCAP_FORM'] / df.groupby(['Date', 'RRR_T'])['MCAP_FORM'].transform('sum')
+    df['w_ret'] = df['w'] * df['RET_SIMPLE']
 
     port = (
-        df.groupby(['Date', 'RRR_T'])['w_return']
+        df.groupby(['Date', 'RRR_T'])['w_ret']
         .sum()
         .unstack('RRR_T')
         .sort_index()
@@ -1171,11 +1398,11 @@ def run_risk_analysis(returns_merged, ff_factors):
         print("  No valid portfolio data for risk analysis")
         return results
 
-    # Risk metrics
+    # Risk metrics (port columns are SIMPLE monthly returns)
     risk_metrics = []
     for col in port.columns:
         rets = port[col].dropna()
-        cum = np.exp(rets.cumsum())
+        cum = (1 + rets).cumprod()          # wealth index from simple returns
         cum_max = cum.cummax()
         drawdown = (cum / cum_max - 1).min()
 
@@ -1229,8 +1456,8 @@ def run_risk_analysis(returns_merged, ff_factors):
 # PHASE 4: ADDITIONAL TESTS
 # =============================================================================
 
-def phase4_additional_tests(df_filtered, returns_merged, ff_factors, returns=None):
-    """Same-growth placebo and robustness tests."""
+def phase4_additional_tests(df_filtered, panel, returns, ff_factors):
+    """Same-growth placebo and robustness tests, all on the holding panel."""
 
     print("\n" + "=" * 80)
     print("PHASE 4: ADDITIONAL TESTS")
@@ -1240,40 +1467,34 @@ def phase4_additional_tests(df_filtered, returns_merged, ff_factors, returns=Non
 
     # --- 4.1 Same-growth placebo (median split) ---
     print("\n--- 4.1 Same-growth placebo (median split) ---")
-    results['placebo'] = run_placebo_median_split(returns_merged, ff_factors)
+    results['placebo'] = run_placebo_median_split(panel, ff_factors)
 
     # --- 4.2 Robustness: No-COVID (quartile) ---
-    print("\n--- 4.4 Robustness: Excluding COVID (quartile) ---")
-    ret_no_covid_q = returns_merged[
-        ~((returns_merged['Date'] >= '2020-01-01') & (returns_merged['Date'] <= '2021-06-30'))
+    print("\n--- 4.2 Robustness: Excluding COVID (quartile) ---")
+    ret_nc = panel[
+        ~((panel['Date'] >= '2020-01-01') & (panel['Date'] <= '2021-06-30'))
     ].copy()
 
-    if len(ret_no_covid_q) > 0:
-        # Market portfolio (no COVID, for quartile version)
-        ret_sample_q = ret_no_covid_q[~ret_no_covid_q['FIRM'].isin(['SPX INDEX', 'SPW INDEX', 'USBMMY3M INDEX'])].copy()
-        ret_sample_q['MCAP'] = pd.to_numeric(ret_sample_q['HISTORICAL_MARKET_CAP'], errors='coerce')
-        ret_sample_q['MCAP_TOTAL'] = ret_sample_q.groupby('Date')['MCAP'].transform('sum')
-        ret_sample_q['w_mkt'] = ret_sample_q['MCAP'] / ret_sample_q['MCAP_TOTAL']
-        ret_sample_q['w_ret_mkt'] = ret_sample_q['w_mkt'] * ret_sample_q['RETURN_LOG']
-        market_ret_nc_q = ret_sample_q.groupby('Date')['w_ret_mkt'].sum().sort_index()
+    if len(ret_nc) > 0:
+        market_ret_nc = value_weighted_market(ret_nc)
+        ret_nc['ADJ_RRR_PCT'] = pd.to_numeric(ret_nc['ADJ_RRR_PCT'], errors='coerce')
+        ret_nc['RRR_Q_NC'] = ret_nc.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_quartile)
 
-        ret_no_covid_q['ADJ_RRR_PCT_LAG1'] = pd.to_numeric(ret_no_covid_q['ADJ_RRR_PCT_LAG1'], errors='coerce')
-        ret_no_covid_q['RRR_Q_NC'] = ret_no_covid_q.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_quartile)
-
-        port_nc_q = build_portfolio_returns(ret_no_covid_q, 'RRR_Q_NC', market_ret_nc_q)
+        port_nc_q = build_portfolio_returns(ret_nc, 'RRR_Q_NC', market_ret_nc)
         if port_nc_q is not None:
             run_factor_regressions(port_nc_q, ff_factors, 'RRR ADJ VW NoCOVID Quartile')
             results['no_covid_quartile'] = port_nc_q
 
     # --- 4.3 Robustness: Equal-weighted (quartile) ---
     print("\n--- 4.3 Robustness: Equal-weighted portfolios (quartile) ---")
-    ret_ew_q = returns_merged.copy()
-    ret_ew_q['ADJ_RRR_PCT_LAG1'] = pd.to_numeric(ret_ew_q['ADJ_RRR_PCT_LAG1'], errors='coerce')
-    ret_ew_q['RRR_Q_EW'] = ret_ew_q.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_quartile)
+    ret_ew_q = panel.copy()
+    ret_ew_q['ADJ_RRR_PCT'] = pd.to_numeric(ret_ew_q['ADJ_RRR_PCT'], errors='coerce')
+    ret_ew_q['RRR_Q_EW'] = ret_ew_q.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_quartile)
 
     df_ew_q = ret_ew_q.dropna(subset=['RRR_Q_EW']).copy()
+    # Equal-weight SIMPLE returns (not log returns)
     port_ew_q = (
-        df_ew_q.groupby(['Date', 'RRR_Q_EW'])['RETURN_LOG']
+        df_ew_q.groupby(['Date', 'RRR_Q_EW'])['RET_SIMPLE']
         .mean()
         .unstack('RRR_Q_EW')
         .sort_index()
@@ -1282,10 +1503,10 @@ def phase4_additional_tests(df_filtered, returns_merged, ff_factors, returns=Non
         port_ew_q['Q1-Q4'] = port_ew_q['Q1'] - port_ew_q['Q4']
 
     # EW market (quartile version)
-    ew_mkt_q = df_ew_q.groupby('Date')['RETURN_LOG'].mean().sort_index()
+    ew_mkt_q = df_ew_q.groupby('Date')['RET_SIMPLE'].mean().sort_index()
     port_ew_q['MKT'] = ew_mkt_q.reindex(port_ew_q.index)
 
-    print(f"  EW quartile portfolio returns (annualized):")
+    print(f"  EW quartile portfolio SIMPLE returns (annualized):")
     for col in port_ew_q.columns:
         ann = port_ew_q[col].mean() * 12 * 100
         print(f"    {col}: {ann:.2f}%")
@@ -1293,65 +1514,52 @@ def phase4_additional_tests(df_filtered, returns_merged, ff_factors, returns=Non
     run_factor_regressions(port_ew_q, ff_factors, 'RRR ADJ EW Quartile')
     results['ew_quartile'] = port_ew_q
 
-    # --- 4.4 Robustness: Lag-2 portfolios ---
-    if returns is not None:
-        print("\n--- 4.4 Robustness: Lag-2 portfolios (2-quarter gap) ---")
-        results['lag2'] = run_lag2_portfolios(df_filtered, returns, ff_factors)
+    # --- 4.4 Robustness: one-extra-quarter formation gap ---
+    # Form 3 months later than the headline spec (FORM_LAG_MONTHS + 3), same
+    # 3-month hold. Tests whether the RRR effect survives an even longer gap.
+    print("\n--- 4.4 Robustness: one-extra-quarter formation gap ---")
+    results['extra_lag'] = run_extra_lag_portfolios(df_filtered, returns, ff_factors)
 
     return results
 
 
-def run_lag2_portfolios(df_filtered, returns, ff_factors):
-    """Robustness: quartile sorts with a 2-quarter lag (returns in Q_{t+2} from signal in Q_t).
+def run_extra_lag_portfolios(df_filtered, returns, ff_factors):
+    """Robustness: form the portfolio ONE EXTRA QUARTER later than the headline.
 
-    Shifts the QUARTER key back by 2 quarters so each monthly return in quarter Q_t
-    matches the signal observed at the end of Q_{t-2}. This tests whether RRR
-    predicts returns beyond the immediate post-sort quarter, ruling out contamination
-    by earnings surprises concentrated in the quarter following the signal.
+    Uses build_holding_panel with a formation gap of FORM_LAG_MONTHS + 3 months
+    (still a 3-month hold), so the signal at quarter-end Q predicts returns roughly
+    two quarters out instead of one. This tests whether the RRR effect survives an
+    even longer gap and is not an artifact of the immediate post-signal quarter.
+    Same value-weighting (formation market cap) and simple-return aggregation as
+    the headline.
     """
 
-    print("\n  === Lag-2 robustness portfolios (2-quarter gap) ===")
+    print("\n  === Extra-quarter formation gap (form 5 months after quarter-end) ===")
 
-    # Shift QUARTER reference back one additional quarter (vs. main spec which uses -1)
-    ret2 = returns.copy()
-    ret2['QUARTER'] = (
-        ret2['Date'].dt.to_period('Q')
-        .apply(lambda x: x - 2)
-        .dt.to_timestamp('Q', 'end')
-    )
+    panel2 = build_holding_panel(df_filtered, returns,
+                                 form_lag=FORM_LAG_MONTHS + 3, hold=HOLD_MONTHS)
 
-    ret2_merged = merge_signals_to_returns(df_filtered, ret2)
-
-    if ret2_merged.empty or len(ret2_merged) < 100:
-        print("  Insufficient data for lag-2 portfolios")
+    if panel2.empty or len(panel2) < 100:
+        print("  Insufficient data for extra-lag portfolios")
         return {}
 
-    # VW market portfolio
-    ret_sample = ret2_merged[
-        ~ret2_merged['FIRM'].isin(['SPX INDEX', 'SPW INDEX', 'USBMMY3M INDEX'])
-    ].copy()
-    ret_sample['MCAP'] = pd.to_numeric(ret_sample['HISTORICAL_MARKET_CAP'], errors='coerce')
-    ret_sample['MCAP_TOTAL'] = ret_sample.groupby('Date')['MCAP'].transform('sum')
-    ret_sample['w_mkt'] = ret_sample['MCAP'] / ret_sample['MCAP_TOTAL']
-    ret_sample['w_ret_mkt'] = ret_sample['w_mkt'] * ret_sample['RETURN_LOG']
-    market_ret_lag2 = ret_sample.groupby('Date')['w_ret_mkt'].sum().sort_index()
+    market_ret2 = value_weighted_market(panel2)
 
-    # Adj RRR quartile sort
-    ret2_merged['ADJ_RRR_PCT_LAG1'] = pd.to_numeric(ret2_merged['ADJ_RRR_PCT_LAG1'], errors='coerce')
-    ret2_merged['RRR_Q_LAG2'] = ret2_merged.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_quartile)
+    panel2['ADJ_RRR_PCT'] = pd.to_numeric(panel2['ADJ_RRR_PCT'], errors='coerce')
+    panel2['RRR_Q_XL'] = panel2.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_quartile)
 
-    port_lag2 = build_portfolio_returns(ret2_merged, 'RRR_Q_LAG2', market_ret_lag2)
-    if port_lag2 is not None:
-        reg_results = run_factor_regressions(port_lag2, ff_factors, 'RRR ADJ VW Lag2')
+    port_xl = build_portfolio_returns(panel2, 'RRR_Q_XL', market_ret2)
+    if port_xl is not None:
+        reg_results = run_factor_regressions(port_xl, ff_factors, 'RRR ADJ VW ExtraQuarterLag')
         if reg_results:
             reg_df = pd.DataFrame(reg_results).T.reset_index()
             reg_df.rename(columns={'index': 'Unnamed: 0'}, inplace=True)
             reg_df.to_excel(os.path.join(OUTPUT_DIR, 'factor_reg_Lag2_adj.xlsx'), index=False)
 
-    return {'port': port_lag2}
+    return {'port': port_xl}
 
 
-def run_placebo_median_split(returns_merged, ff_factors):
+def run_placebo_median_split(panel, ff_factors):
     """Same-growth placebo: top-growth-quartile firms split at median of adj RRR.
 
     Restrict to firms in the top revenue-growth quartile (~31 firms per quarter),
@@ -1360,9 +1568,9 @@ def run_placebo_median_split(returns_merged, ff_factors):
     beyond revenue growth level (composition, not level).
     """
 
-    ret = returns_merged.copy()
+    ret = panel.copy()
     ret['REV_GROWTH_PCT'] = pd.to_numeric(ret['REV_GROWTH_PCT'], errors='coerce')
-    ret['ADJ_RRR_PCT_LAG1'] = pd.to_numeric(ret['ADJ_RRR_PCT_LAG1'], errors='coerce')
+    ret['ADJ_RRR_PCT'] = pd.to_numeric(ret['ADJ_RRR_PCT'], errors='coerce')
 
     # Identify top revenue-growth quartile per DATE (Q1 = highest growth)
     def assign_growth_quartile(x):
@@ -1392,16 +1600,17 @@ def run_placebo_median_split(returns_merged, ff_factors):
             index=x.index
         )
 
-    high_growth['RRR_MED'] = high_growth.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(median_split)
+    high_growth['RRR_MED'] = high_growth.groupby('QUARTER')['ADJ_RRR_PCT'].transform(median_split)
 
     df_pl = high_growth.dropna(subset=['RRR_MED']).copy()
-    df_pl['MCAP'] = pd.to_numeric(df_pl['HISTORICAL_MARKET_CAP'], errors='coerce')
-    df_pl['MCAP_SUM'] = df_pl.groupby(['Date', 'RRR_MED'])['MCAP'].transform('sum')
-    df_pl['w'] = df_pl['MCAP'] / df_pl['MCAP_SUM']
-    df_pl['w_return'] = df_pl['w'] * df_pl['RETURN_LOG']
+    df_pl['MCAP_FORM'] = pd.to_numeric(df_pl['MCAP_FORM'], errors='coerce')
+    df_pl['RET_SIMPLE'] = pd.to_numeric(df_pl['RET_SIMPLE'], errors='coerce')
+    df_pl = df_pl.dropna(subset=['MCAP_FORM', 'RET_SIMPLE'])
+    df_pl['w'] = df_pl['MCAP_FORM'] / df_pl.groupby(['Date', 'RRR_MED'])['MCAP_FORM'].transform('sum')
+    df_pl['w_ret'] = df_pl['w'] * df_pl['RET_SIMPLE']  # value-weight SIMPLE returns
 
     port_pl = (
-        df_pl.groupby(['Date', 'RRR_MED'])['w_return']
+        df_pl.groupby(['Date', 'RRR_MED'])['w_ret']
         .sum()
         .unstack('RRR_MED')
         .sort_index()
@@ -1645,36 +1854,22 @@ def run_alt_metric_analysis(df_filtered, returns, ff_factors):
     # =========================================================================
     print("\n--- 1D.D Portfolio sorts + FF3 ---")
 
-    sig_lag_cols = ['ADJ_LR_RRR_PCT_LAG1', 'ADJ_SRR_PCT_LAG1', 'ADJ_CUMRR_PCT_LAG1']
-    df_q = df_filtered.reset_index()[
-        ['FIRM', 'DATE'] + sig_lag_cols + ['HISTORICAL_MARKET_CAP']
-    ].copy()
-    df_q['DATE'] = pd.to_datetime(df_q['DATE'])
-    df_q['QUARTER'] = df_q['DATE'].dt.to_period('Q').dt.to_timestamp('Q', 'end')
-    df_q['FIRM'] = df_q['FIRM'].str.upper()
-
-    ret = returns.copy()
-    ret['FIRM'] = ret['FIRM'].str.upper()
-    ret_m = ret.merge(df_q.drop(columns=['DATE']), on=['FIRM', 'QUARTER'], how='inner')
-    valid_firms = df_filtered.index.get_level_values('FIRM').unique()
-    ret_m = ret_m[ret_m['FIRM'].isin(valid_firms)]
-    print(f"  Merged: {len(ret_m)} monthly obs, {ret_m['FIRM'].nunique()} firms")
+    # Build the holding panel (identical k=2 formation / 3-month hold timing as
+    # the headline) so the alternative-metric sorts use the same convention and
+    # weight by formation-date market cap on SIMPLE returns.
+    ret_m = build_holding_panel(df_filtered, returns)
+    print(f"  Holding panel: {len(ret_m)} monthly obs, {ret_m['FIRM'].nunique()} firms")
 
     if ret_m.empty:
-        print("  No data after merge. Skipping portfolio analysis.")
+        print("  No data in holding panel. Skipping portfolio analysis.")
         return
 
-    sample_m = ret_m[~ret_m['FIRM'].isin(['SPX INDEX', 'SPW INDEX', 'USBMMY3M INDEX'])].copy()
-    sample_m['MCAP'] = pd.to_numeric(sample_m['HISTORICAL_MARKET_CAP'], errors='coerce')
-    sample_m['MCAP_TOTAL'] = sample_m.groupby('Date')['MCAP'].transform('sum')
-    sample_m['w'] = sample_m['MCAP'] / sample_m['MCAP_TOTAL']
-    sample_m['w_ret'] = sample_m['w'] * sample_m['RETURN_LOG']
-    market_ret_alt = sample_m.groupby('Date')['w_ret'].sum().sort_index()
+    market_ret_alt = value_weighted_market(ret_m)
 
     alt_signals = [
-        ('Adj LR_RRR', 'ADJ_LR_RRR_PCT_LAG1'),
-        ('Adj SRR',    'ADJ_SRR_PCT_LAG1'),
-        ('Adj CUMRR',  'ADJ_CUMRR_PCT_LAG1'),
+        ('Adj LR_RRR', 'ADJ_LR_RRR_PCT'),
+        ('Adj SRR',    'ADJ_SRR_PCT'),
+        ('Adj CUMRR',  'ADJ_CUMRR_PCT'),
     ]
 
     ff3_results = {}
@@ -1771,9 +1966,19 @@ def run_alt_metric_analysis(df_filtered, returns, ff_factors):
 # =============================================================================
 
 if __name__ == '__main__':
+    import datetime
+    import json
+    import platform
+
+    # Run manifest: a date-time run ID so this run's outputs are identifiable later.
+    RUN_ID = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+
     print("=" * 80)
     print("  RRR FINANCIAL IMPLICATIONS — ANALYSIS V2")
     print("  Revenue Retention Rates & Stock Prices: High Returns, Low Risk")
+    print(f"  RUN ID: {RUN_ID}")
+    print(f"  Timing convention: form {FORM_LAG_MONTHS} months after quarter-end, "
+          f"hold {HOLD_MONTHS} months")
     print("=" * 80)
     print()
 
@@ -1789,24 +1994,39 @@ if __name__ == '__main__':
     # Phase 1D: Alternative metric analysis
     run_alt_metric_analysis(df_filtered, returns, ff_factors)
 
-    # Phase 2: Empirical analysis
+    # Phase 2: Empirical analysis (builds the holding panel; sorts, CAPM, FM, risk)
     empirical_results = phase2_empirical(df_filtered, returns, ff_factors)
+    panel = empirical_results['panel']
 
-    # Phase 4: Additional tests
-    returns_merged = merge_signals_to_returns(df_filtered, returns)
-    additional_results = phase4_additional_tests(df_filtered, returns_merged, ff_factors, returns=returns)
+    # Phase 4: Additional tests (share the same holding panel)
+    additional_results = phase4_additional_tests(df_filtered, panel, returns, ff_factors)
+
+    # Write the run manifest.
+    manifest = {
+        'run_id': RUN_ID,
+        'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+        'form_lag_months': FORM_LAG_MONTHS,
+        'hold_months': HOLD_MONTHS,
+        'n_firms': int(df_filtered.index.get_level_values('FIRM').nunique()),
+        'expected_n_firms': EXPECTED_N_FIRMS,
+        'python_version': platform.python_version(),
+        'pandas_version': pd.__version__,
+    }
+    manifest_path = os.path.join(OUTPUT_DIR, f'run_manifest_{RUN_ID}.json')
+    with open(manifest_path, 'w') as fh:
+        json.dump(manifest, fh, indent=2)
 
     print("\n" + "=" * 80)
     print("  ANALYSIS COMPLETE")
+    print(f"  RUN ID: {RUN_ID}")
+    print(f"  Manifest: {manifest_path}")
     print(f"  All outputs saved to: {OUTPUT_DIR}")
     print("=" * 80)
 
     # List output files
-    # Factor regression results are returned in-memory only (no .xlsx per regression).
-    # Data summary exports: fama_macbeth.xlsx, pooled_descriptives.xlsx,
-    #                       industry_descriptives.xlsx, risk_analysis.xlsx
     print("\n  Output files:")
     for f in sorted(os.listdir(OUTPUT_DIR)):
         fpath = os.path.join(OUTPUT_DIR, f)
-        size = os.path.getsize(fpath)
-        print(f"    {f} ({size:,} bytes)")
+        if os.path.isfile(fpath):
+            size = os.path.getsize(fpath)
+            print(f"    {f} ({size:,} bytes)")
