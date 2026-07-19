@@ -37,13 +37,30 @@ os.makedirs(TABLE_DIR, exist_ok=True)
 os.makedirs(FIGURE_DIR, exist_ok=True)
 
 # Import analysis_v2 functions
+# NOTE (Stage 5 canonical-run rebuild): value_weighted_market, run_factor_regressions
+# and safe_quartile are imported here (not reimplemented locally) so that every
+# portfolio built in this script uses the EXACT SAME construction as
+# identification_battery.py / robustness_diagnostics.py / exclude_amazon_robustness.py:
+# build_holding_panel() -> value_weighted_market() / build_portfolio_returns()
+# (formation-date MCAP_FORM weights, SIMPLE returns) -> run_factor_regressions()
+# (Newey-West OLS, automatic Newey-West 1994 bandwidth -- do not hardcode max_lags
+# when calling newey_west_ols() for any of these tables; see the Stage 5 fix note
+# inside _run_inline_factor_reg() below for the bug this caused). Prior to this fix, Step 0b below reconstructed portfolios
+# inline using RETURN_LOG (log returns) and the stale quarter-end HISTORICAL_MARKET_CAP,
+# which does NOT match the canonical build_portfolio_returns() convention (simple
+# returns, formation-date market cap) and produced alphas that diverged from the
+# canonical baseline (e.g. the old inline Q1-Q4 ADJ RRR FF3 alpha was ~2.36%/mo vs the
+# canonical 1.9198%/mo baseline confirmed across identification_battery.py,
+# robustness_diagnostics.py and exclude_amazon_robustness.py's own "[CHECK]" assertions).
 sys.path.insert(0, CODE_DIR)
 from analysis_v2 import (
     phase1_load_and_diagnose, phase1b_load_ff_factors, phase1c_load_monthly_returns,
-    merge_signals_to_returns, safe_tercile, build_portfolio_returns, newey_west_ols
+    merge_signals_to_returns, safe_tercile, safe_quartile, build_portfolio_returns,
+    newey_west_ols, value_weighted_market, run_factor_regressions, build_holding_panel,
 )
 
-# Import export_table tool
+# Import export_table tool (house style: booktabs + threeparttable, no significance
+# stars, exact p-values in brackets)
 sys.path.insert(0, os.path.expanduser('~/.claude/tools'))
 from export_table import export_custom_table
 
@@ -101,42 +118,50 @@ def fmt_int(v):
     return f"{int(v):,}"
 
 
-def stars_from_t(t_stat):
-    """Return significance stars from t-statistic (legacy — use _stars() for new tables)."""
-    t = abs(t_stat)
-    if t > 2.576:
-        return "$^{***}$"
-    elif t > 1.96:
-        return "$^{**}$"
-    elif t > 1.645:
-        return "$^{*}$"
-    return ""
+# stars_from_t() (legacy significance-stars helper) has been removed as part of the
+# Stage 5 house-style pass. No function in this file may produce '*'/'**'/'***' —
+# house style is exact p-values in brackets only (see _fmt_pval above).
 
 
 # ---------------------------------------------------------------------------
 # Revenue_Growth-style table helpers
 # ---------------------------------------------------------------------------
 
-def _stars(pval):
-    """Return significance stars from p-value."""
-    if pval < 0.01:
-        return '***'
-    if pval < 0.05:
-        return '**'
-    if pval < 0.10:
-        return '*'
-    return ''
+# House style (style_guide.md, CLAUDE.md hard constraint): NO significance stars,
+# anywhere, ever. Exact p-values are reported in brackets instead. _stars() has been
+# removed on purpose -- do not reintroduce it. _fmt_coef() below intentionally has no
+# pval parameter so it cannot silently grow stars back in.
 
-
-def _fmt_coef(coef, pval, decimals=4):
-    """Format coefficient with significance stars and LaTeX minus sign."""
+def _fmt_coef(coef, decimals=4):
+    """Format coefficient with LaTeX minus sign. No significance stars (house style)."""
+    if pd.isna(coef):
+        return ''
     sign = '$-$' if coef < 0 else ''
-    return f"{sign}{abs(coef):.{decimals}f}{_stars(pval)}"
+    return f"{sign}{abs(coef):.{decimals}f}"
 
 
 def _fmt_se(se, decimals=4):
     """Format standard error in parentheses."""
+    if pd.isna(se):
+        return ''
     return f"({se:.{decimals}f})"
+
+
+def _fmt_pval(pval, decimals=3):
+    """Format an exact p-value in brackets, no leading zero, '<.001'-style floor
+    below the display precision. Matches this paper's existing table convention
+    (e.g. [.003], [<.001]) and style_guide.md's 3-decimal p-value rule."""
+    if pd.isna(pval):
+        return ''
+    floor = 10 ** (-decimals)
+    if pval < floor:
+        return f"[<{floor:.{decimals}f}]".replace('0.', '.', 1)
+    s = f"{pval:.{decimals}f}"
+    if s.startswith('0.'):
+        s = s[1:]
+    elif s.startswith('-0.'):
+        s = '-' + s[2:]
+    return f"[{s}]"
 
 
 def _write_tabular(lines, output_path):
@@ -147,16 +172,9 @@ def _write_tabular(lines, output_path):
     print(f"  Written: {os.path.basename(output_path)}")
 
 
-def safe_quartile(x):
-    """Assign quartiles: Q1=highest value, Q4=lowest value.
-    Labels are reversed so the best (highest) firms receive Q1 — consistent with analysis_v2.py."""
-    x = x.dropna()
-    if x.nunique() < 4 or len(x) < 8:
-        return pd.Series([np.nan]*len(x), index=x.index)
-    try:
-        return pd.qcut(x, 4, labels=['Q4', 'Q3', 'Q2', 'Q1'])
-    except ValueError:
-        return pd.Series([np.nan]*len(x), index=x.index)
+# safe_quartile is imported from analysis_v2 (removed the local duplicate that used
+# to live here) so quartile assignment is byte-identical to every other script in the
+# canonical pipeline.
 
 
 def _se_from_t(coef, t_stat):
@@ -177,13 +195,17 @@ print("\n[Step 0] Loading data via analysis_v2 pipeline...")
 df_long, df_filtered, industry_stats = phase1_load_and_diagnose()
 ff_factors = phase1b_load_ff_factors()
 returns = phase1c_load_monthly_returns()
-returns_merged = merge_signals_to_returns(df_filtered, returns)
+# merge_signals_to_returns() is a backward-compat alias for build_holding_panel():
+# 2-month formation lag, 3-month hold, one row per (firm, holding-month). This IS the
+# canonical timing (analysis_v2.py commit 1fce67f) -- unchanged from before.
+panel = merge_signals_to_returns(df_filtered, returns)
 
 # Also read pre-computed Excel files
 pooled_desc = pd.read_excel(os.path.join(OUTPUT_DIR, 'pooled_descriptives.xlsx'))
 industry_desc = pd.read_excel(os.path.join(OUTPUT_DIR, 'industry_descriptives.xlsx'))
 risk_analysis = pd.read_excel(os.path.join(OUTPUT_DIR, 'risk_analysis.xlsx'))
 fama_macbeth = pd.read_excel(os.path.join(OUTPUT_DIR, 'fama_macbeth.xlsx'))
+portfolio_char_xlsx = pd.read_excel(os.path.join(OUTPUT_DIR, 'portfolio_characteristics.xlsx'))
 
 print("\n  Data loaded successfully.")
 
@@ -191,158 +213,113 @@ print("\n  Data loaded successfully.")
 # ============================================================================
 # BUILD PORTFOLIO RETURN TIME SERIES (for figures and inline factor regressions)
 # ============================================================================
-print("\n[Step 0b] Building portfolio return time series...")
+# STAGE 5 FIX (canonical-run rebuild): every portfolio below is now built with
+#   panel.groupby('QUARTER')[<contemporaneous signal column>].transform(safe_quartile)
+#   -> build_portfolio_returns(panel, bucket_col, market_ret)
+# i.e. the EXACT SAME two calls identification_battery.py / robustness_diagnostics.py /
+# exclude_amazon_robustness.py use for the confirmed canonical baseline
+# (ADJ RRR Q1-Q4: FF3=1.9198%/mo t=2.94, FF5=2.1547%/mo t=3.29, N=88).
+#
+# This replaces a prior version of this block that had TWO bugs relative to that
+# baseline: (1) it value-weighted using the stale quarter-end HISTORICAL_MARKET_CAP
+# instead of the formation-date MCAP_FORM, and aggregated RETURN_LOG (log returns)
+# instead of RET_SIMPLE -- build_portfolio_returns()'s own docstring is explicit that
+# a value-weighted mean of log returns is biased and "deliberately not used anywhere
+# here"; and (2) it sorted on '<signal>_LAG1' columns (an extra .shift(1) computed in
+# phase1_load_and_diagnose for a pre-timing-fix design), which stacks a SECOND lag on
+# top of the formation gap that build_holding_panel() already applies -- exactly the
+# "stacked double lag" bug commit 1fce67f fixed in analysis_v2.py itself. Sorts now use
+# the CONTEMPORANEOUS quarter-end columns (ADJ_RRR_PCT, RRR_PCT, ...) already present on
+# `panel`, matching build_holding_panel()'s own docstring convention.
+print("\n[Step 0b] Building portfolio return time series (canonical timing)...")
 
-ret = returns_merged.copy()
-for col in ['RRR_PCT_LAG1', 'ACQ_RATE_PCT_LAG1', 'ADJ_RRR_PCT_LAG1',
-            'ADJ_ACQ_RATE_PCT_LAG1', 'HISTORICAL_MARKET_CAP']:
-    ret[col] = pd.to_numeric(ret[col], errors='coerce')
+market_ret = value_weighted_market(panel)
 
-# Market portfolio (value-weighted, all sample firms)
-ret_sample = ret[~ret['FIRM'].isin(['SPX INDEX', 'SPW INDEX', 'USBMMY3M INDEX'])].copy()
-ret_sample['MCAP'] = ret_sample['HISTORICAL_MARKET_CAP']
-ret_sample['MCAP_TOTAL'] = ret_sample.groupby('Date')['MCAP'].transform('sum')
-ret_sample['w_mkt'] = ret_sample['MCAP'] / ret_sample['MCAP_TOTAL']
-ret_sample['w_ret_mkt'] = ret_sample['w_mkt'] * ret_sample['RETURN_LOG']
-market_ret = ret_sample.groupby('Date')['w_ret_mkt'].sum().sort_index()
+# Keep `ret` as an alias for `panel` -- Figures 17/18 further below still reference
+# `ret[['RRR_Q', 'REV_GROWTH_PCT']]` at firm-holding-month granularity.
+ret = panel
 
-# --- Tercile portfolios (RRR adjusted) — kept for double-sort and legacy use ---
-ret['RRR_T'] = ret.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_tercile)
-port_rrr_t = build_portfolio_returns(ret, 'RRR_T', market_ret)
-
-# --- Tercile portfolios (AR adjusted) ---
-ret['AR_T'] = ret.groupby('QUARTER')['ADJ_ACQ_RATE_PCT_LAG1'].transform(safe_tercile)
-port_ar_t = build_portfolio_returns(ret, 'AR_T', market_ret)
-
-# --- Quartile portfolios (adjusted RRR) ---
-ret['RRR_Q'] = ret.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_quartile)
-df_q = ret.dropna(subset=['RRR_Q']).copy()
-df_q['MCAP'] = pd.to_numeric(df_q['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_q['MCAP_SUM'] = df_q.groupby(['Date', 'RRR_Q'])['MCAP'].transform('sum')
-df_q['w'] = df_q['MCAP'] / df_q['MCAP_SUM']
-df_q['w_return'] = df_q['w'] * df_q['RETURN_LOG']
-port_rrr_q = (
-    df_q.groupby(['Date', 'RRR_Q'])['w_return']
-    .sum()
-    .unstack('RRR_Q')
-    .sort_index()
-)
-# Q1=High adjusted RRR (best), Q4=Low adjusted RRR (worst)
-if 'Q1' in port_rrr_q.columns and 'Q4' in port_rrr_q.columns:
-    port_rrr_q['Q1-Q4'] = port_rrr_q['Q1'] - port_rrr_q['Q4']
+# --- Quartile portfolios (adjusted RRR) — MAIN RESULT / headline ---
+panel['RRR_Q'] = panel.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_quartile)
+port_rrr_q = build_portfolio_returns(panel, 'RRR_Q', market_ret)
 port_rrr_q['MKT'] = market_ret.reindex(port_rrr_q.index)
 
 # --- Quartile portfolios (adjusted AR) ---
-ret['AR_Q'] = ret.groupby('QUARTER')['ADJ_ACQ_RATE_PCT_LAG1'].transform(safe_quartile)
-df_q_ar = ret.dropna(subset=['AR_Q']).copy()
-df_q_ar['MCAP'] = pd.to_numeric(df_q_ar['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_q_ar['MCAP_SUM'] = df_q_ar.groupby(['Date', 'AR_Q'])['MCAP'].transform('sum')
-df_q_ar['w'] = df_q_ar['MCAP'] / df_q_ar['MCAP_SUM']
-df_q_ar['w_return'] = df_q_ar['w'] * df_q_ar['RETURN_LOG']
-port_ar_q = (
-    df_q_ar.groupby(['Date', 'AR_Q'])['w_return']
-    .sum()
-    .unstack('AR_Q')
-    .sort_index()
-)
-# Q1=High adjusted AR (best), Q4=Low adjusted AR (worst)
-if 'Q1' in port_ar_q.columns and 'Q4' in port_ar_q.columns:
-    port_ar_q['Q1-Q4'] = port_ar_q['Q1'] - port_ar_q['Q4']
+panel['AR_Q'] = panel.groupby('QUARTER')['ADJ_ACQ_RATE_PCT'].transform(safe_quartile)
+port_ar_q = build_portfolio_returns(panel, 'AR_Q', market_ret)
 port_ar_q['MKT'] = market_ret.reindex(port_ar_q.index)
 
 # --- Quartile portfolios (raw RRR) — for Table 4 Panel A ---
-ret['RRR_RAW_Q'] = ret.groupby('QUARTER')['RRR_PCT_LAG1'].transform(safe_quartile)
-df_q_rrr_raw = ret.dropna(subset=['RRR_RAW_Q']).copy()
-df_q_rrr_raw['MCAP'] = pd.to_numeric(df_q_rrr_raw['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_q_rrr_raw['MCAP_SUM'] = df_q_rrr_raw.groupby(['Date', 'RRR_RAW_Q'])['MCAP'].transform('sum')
-df_q_rrr_raw['w'] = df_q_rrr_raw['MCAP'] / df_q_rrr_raw['MCAP_SUM']
-df_q_rrr_raw['w_return'] = df_q_rrr_raw['w'] * df_q_rrr_raw['RETURN_LOG']
-port_rrr_raw_q = (
-    df_q_rrr_raw.groupby(['Date', 'RRR_RAW_Q'])['w_return']
-    .sum()
-    .unstack('RRR_RAW_Q')
-    .sort_index()
-)
-if 'Q1' in port_rrr_raw_q.columns and 'Q4' in port_rrr_raw_q.columns:
-    port_rrr_raw_q['Q1-Q4'] = port_rrr_raw_q['Q1'] - port_rrr_raw_q['Q4']
+panel['RRR_RAW_Q'] = panel.groupby('QUARTER')['RRR_PCT'].transform(safe_quartile)
+port_rrr_raw_q = build_portfolio_returns(panel, 'RRR_RAW_Q', market_ret)
 port_rrr_raw_q['MKT'] = market_ret.reindex(port_rrr_raw_q.index)
 
 # --- Quartile portfolios (raw AR) — for Table 5 Panel A ---
-ret['AR_RAW_Q'] = ret.groupby('QUARTER')['ACQ_RATE_PCT_LAG1'].transform(safe_quartile)
-df_q_ar_raw = ret.dropna(subset=['AR_RAW_Q']).copy()
-df_q_ar_raw['MCAP'] = pd.to_numeric(df_q_ar_raw['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_q_ar_raw['MCAP_SUM'] = df_q_ar_raw.groupby(['Date', 'AR_RAW_Q'])['MCAP'].transform('sum')
-df_q_ar_raw['w'] = df_q_ar_raw['MCAP'] / df_q_ar_raw['MCAP_SUM']
-df_q_ar_raw['w_return'] = df_q_ar_raw['w'] * df_q_ar_raw['RETURN_LOG']
-port_ar_raw_q = (
-    df_q_ar_raw.groupby(['Date', 'AR_RAW_Q'])['w_return']
-    .sum()
-    .unstack('AR_RAW_Q')
-    .sort_index()
-)
-if 'Q1' in port_ar_raw_q.columns and 'Q4' in port_ar_raw_q.columns:
-    port_ar_raw_q['Q1-Q4'] = port_ar_raw_q['Q1'] - port_ar_raw_q['Q4']
+panel['AR_RAW_Q'] = panel.groupby('QUARTER')['ACQ_RATE_PCT'].transform(safe_quartile)
+port_ar_raw_q = build_portfolio_returns(panel, 'AR_RAW_Q', market_ret)
 port_ar_raw_q['MKT'] = market_ret.reindex(port_ar_raw_q.index)
 
 # --- No-COVID quartile portfolios (adjusted RRR) — for Table 8 Panel A ---
-ret_nc = ret[~((ret['Date'] >= '2020-01-01') & (ret['Date'] <= '2021-06-30'))].copy()
-ret_nc['RRR_Q_NC'] = ret_nc.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_quartile)
-ret_nc_sample = ret_nc[~ret_nc['FIRM'].isin(['SPX INDEX', 'SPW INDEX', 'USBMMY3M INDEX'])].copy()
-ret_nc_sample['MCAP'] = ret_nc_sample['HISTORICAL_MARKET_CAP']
-ret_nc_sample['MCAP_TOTAL'] = ret_nc_sample.groupby('Date')['MCAP'].transform('sum')
-ret_nc_sample['w_mkt'] = ret_nc_sample['MCAP'] / ret_nc_sample['MCAP_TOTAL']
-ret_nc_sample['w_ret_mkt'] = ret_nc_sample['w_mkt'] * ret_nc_sample['RETURN_LOG']
-market_ret_nc = ret_nc_sample.groupby('Date')['w_ret_mkt'].sum().sort_index()
-df_q_nc = ret_nc.dropna(subset=['RRR_Q_NC']).copy()
-df_q_nc['MCAP'] = pd.to_numeric(df_q_nc['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_q_nc['MCAP_SUM'] = df_q_nc.groupby(['Date', 'RRR_Q_NC'])['MCAP'].transform('sum')
-df_q_nc['w'] = df_q_nc['MCAP'] / df_q_nc['MCAP_SUM']
-df_q_nc['w_return'] = df_q_nc['w'] * df_q_nc['RETURN_LOG']
-port_nc_q = (
-    df_q_nc.groupby(['Date', 'RRR_Q_NC'])['w_return']
-    .sum()
-    .unstack('RRR_Q_NC')
-    .sort_index()
-)
-if 'Q1' in port_nc_q.columns and 'Q4' in port_nc_q.columns:
-    port_nc_q['Q1-Q4'] = port_nc_q['Q1'] - port_nc_q['Q4']
+panel_nc = panel[~((panel['Date'] >= '2020-01-01') & (panel['Date'] <= '2021-06-30'))].copy()
+market_ret_nc = value_weighted_market(panel_nc)
+panel_nc['RRR_Q_NC'] = panel_nc.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_quartile)
+port_nc_q = build_portfolio_returns(panel_nc, 'RRR_Q_NC', market_ret_nc)
 port_nc_q['MKT'] = market_ret_nc.reindex(port_nc_q.index)
 
-# --- Equal-weighted quartile portfolios (adjusted RRR) — for Table 8 Panel B ---
-ret_ew = ret.copy()
-ret_ew['RRR_Q_EW'] = ret_ew.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_quartile)
-df_ew_q = ret_ew.dropna(subset=['RRR_Q_EW']).copy()
+# --- Equal-weighted quartile portfolios (adjusted RRR) — for Table 8 / consolidated
+# robustness table. Mirrors analysis_v2.py phase4_additional_tests() section 4.3
+# EXACTLY: equal-weight RET_SIMPLE (not log returns) within (Date, bucket) on the
+# canonical holding panel. That function computes this same series but does not
+# persist a factor-regression alpha to disk, so this is re-derived here (same
+# unmodified inputs / same two lines of logic) and saved below for traceability.
+panel['RRR_Q_EW'] = panel.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_quartile)
+_df_ew_q = panel.dropna(subset=['RRR_Q_EW']).copy()
+_df_ew_q['RET_SIMPLE'] = pd.to_numeric(_df_ew_q['RET_SIMPLE'], errors='coerce')
 port_ew_q = (
-    df_ew_q.groupby(['Date', 'RRR_Q_EW'])['RETURN_LOG']
+    _df_ew_q.groupby(['Date', 'RRR_Q_EW'])['RET_SIMPLE']
     .mean()
     .unstack('RRR_Q_EW')
     .sort_index()
 )
 if 'Q1' in port_ew_q.columns and 'Q4' in port_ew_q.columns:
     port_ew_q['Q1-Q4'] = port_ew_q['Q1'] - port_ew_q['Q4']
-ew_mkt = df_ew_q.groupby('Date')['RETURN_LOG'].mean().sort_index()
-port_ew_q['MKT'] = ew_mkt.reindex(port_ew_q.index)
+_ew_mkt = _df_ew_q.groupby('Date')['RET_SIMPLE'].mean().sort_index()
+port_ew_q['MKT'] = _ew_mkt.reindex(port_ew_q.index)
 
-# --- Double sort portfolios (3x3, for Figure 12) ---
-ret['RRR_T_DS'] = ret.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_tercile)
-ret['AR_T_DS'] = ret.groupby('QUARTER')['ADJ_ACQ_RATE_PCT_LAG1'].transform(safe_tercile)
-df_ds = ret.dropna(subset=['RRR_T_DS', 'AR_T_DS']).copy()
-df_ds['PORT'] = df_ds['RRR_T_DS'].astype(str) + '_' + df_ds['AR_T_DS'].astype(str)
-df_ds['MCAP'] = pd.to_numeric(df_ds['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_ds['MCAP_SUM'] = df_ds.groupby(['Date', 'PORT'])['MCAP'].transform('sum')
-df_ds['w'] = df_ds['MCAP'] / df_ds['MCAP_SUM']
-df_ds['w_return'] = df_ds['w'] * df_ds['RETURN_LOG']
+# --- Port-forward robustness: 1-year-lag (4-quarter) RRR definition ---
+# "Variant A" in analysis_v2.py phase1_load_and_diagnose (Phase 1.4b): LR_RRR_t =
+# Rev_ret_t / Total_Revenue_{t-4}, i.e. retained revenue measured against the revenue
+# base from four quarters (one year) prior, industry-time adjusted the same way as
+# ADJ_RRR_PCT. This column (ADJ_LR_RRR_PCT) already exists on `panel` (it is one of
+# build_holding_panel()'s alt_cols) and was previously only ever compared via a
+# matplotlib PDF table (run_alt_metric_analysis(), output/alt_metric/portfolio_alphas_
+# ff3.pdf) with no persisted spreadsheet -- ported forward here using the exact same
+# canonical build_portfolio_returns()/run_factor_regressions() pipeline as every other
+# table, and persisted to output/lr_rrr_robustness_stage5.xlsx for traceability.
+panel['LR_RRR_Q'] = panel.groupby('QUARTER')['ADJ_LR_RRR_PCT'].transform(safe_quartile)
+port_lr_rrr_q = build_portfolio_returns(panel, 'LR_RRR_Q', market_ret)
+
+# --- Double sort portfolios (3x3, for Figure 9 heatmap; RRR x AR, NOT the excluded
+# RRR x Size / RRR x BTM double sorts) ---
+panel['RRR_T_DS'] = panel.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_tercile)
+panel['AR_T_DS'] = panel.groupby('QUARTER')['ADJ_ACQ_RATE_PCT'].transform(safe_tercile)
+_df_ds = panel.dropna(subset=['RRR_T_DS', 'AR_T_DS']).copy()
+_df_ds['PORT'] = _df_ds['RRR_T_DS'].astype(str) + '_' + _df_ds['AR_T_DS'].astype(str)
+_df_ds['MCAP_FORM'] = pd.to_numeric(_df_ds['MCAP_FORM'], errors='coerce')
+_df_ds['RET_SIMPLE'] = pd.to_numeric(_df_ds['RET_SIMPLE'], errors='coerce')
+_df_ds['w'] = _df_ds['MCAP_FORM'] / _df_ds.groupby(['Date', 'PORT'])['MCAP_FORM'].transform('sum')
+_df_ds['w_return'] = _df_ds['w'] * _df_ds['RET_SIMPLE']
 port_double = (
-    df_ds.groupby(['Date', 'PORT'])['w_return']
+    _df_ds.groupby(['Date', 'PORT'])['w_return']
     .sum()
     .unstack('PORT')
     .sort_index()
 )
 
 # --- Placebo median-split portfolios — within top quartile of revenue growth ---
-# Restrict to top quartile of revenue growth, then median-split by adjusted RRR
-ret_pl = ret.copy()
-ret_pl['REV_GROWTH_PCT'] = pd.to_numeric(ret_pl['REV_GROWTH_PCT'], errors='coerce')
+# Mirrors analysis_v2.py run_placebo_median_split() exactly (contemporaneous
+# ADJ_RRR_PCT, formation-date MCAP_FORM weights, simple returns).
+panel['REV_GROWTH_PCT'] = pd.to_numeric(panel['REV_GROWTH_PCT'], errors='coerce')
 
 def assign_growth_quartile(x):
     """Assign revenue-growth quartiles: Q1=highest growth."""
@@ -362,16 +339,16 @@ def safe_median_split(x):
     med = x.median()
     return pd.Series(np.where(x >= med, 'High', 'Low'), index=x.index)
 
-ret_pl['GROWTH_Q'] = ret_pl.groupby('QUARTER')['REV_GROWTH_PCT'].transform(assign_growth_quartile)
+panel['GROWTH_Q'] = panel.groupby('QUARTER')['REV_GROWTH_PCT'].transform(assign_growth_quartile)
 # Keep only top-quartile revenue growth firms
-high_growth_q = ret_pl[ret_pl['GROWTH_Q'] == 'Q1_G'].copy()
-# Within this subsample, median-split by adjusted RRR
-high_growth_q['RRR_M_PL'] = high_growth_q.groupby('QUARTER')['ADJ_RRR_PCT_LAG1'].transform(safe_median_split)
+high_growth_q = panel[panel['GROWTH_Q'] == 'Q1_G'].copy()
+# Within this subsample, median-split by contemporaneous adjusted RRR
+high_growth_q['RRR_M_PL'] = high_growth_q.groupby('QUARTER')['ADJ_RRR_PCT'].transform(safe_median_split)
 df_pl = high_growth_q.dropna(subset=['RRR_M_PL']).copy()
-df_pl['MCAP'] = pd.to_numeric(df_pl['HISTORICAL_MARKET_CAP'], errors='coerce')
-df_pl['MCAP_SUM'] = df_pl.groupby(['Date', 'RRR_M_PL'])['MCAP'].transform('sum')
-df_pl['w'] = df_pl['MCAP'] / df_pl['MCAP_SUM']
-df_pl['w_return'] = df_pl['w'] * df_pl['RETURN_LOG']
+df_pl['MCAP_FORM'] = pd.to_numeric(df_pl['MCAP_FORM'], errors='coerce')
+df_pl['RET_SIMPLE'] = pd.to_numeric(df_pl['RET_SIMPLE'], errors='coerce')
+df_pl['w'] = df_pl['MCAP_FORM'] / df_pl.groupby(['Date', 'RRR_M_PL'])['MCAP_FORM'].transform('sum')
+df_pl['w_return'] = df_pl['w'] * df_pl['RET_SIMPLE']
 port_placebo_m = (
     df_pl.groupby(['Date', 'RRR_M_PL'])['w_return']
     .sum()
@@ -386,7 +363,7 @@ port_placebo_m['MKT'] = market_ret.reindex(port_placebo_m.index)
 _pl_firms_per_grp = df_pl.groupby(['QUARTER', 'RRR_M_PL'])['FIRM'].nunique().groupby('RRR_M_PL').mean()
 print(f"  Placebo median-split avg firms/group: {_pl_firms_per_grp.to_dict()}")
 
-print("  Portfolio time series built.")
+print("  Portfolio time series built (canonical build_holding_panel / build_portfolio_returns pipeline).")
 
 
 # ============================================================================
@@ -415,12 +392,23 @@ MODEL_FACTORS = {
 
 # Standard table footnote for factor regression tables
 FACTOR_REG_NOTE = (
-    r'\textit{Note: OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'\textit{Note: OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 
-# Newey-West lag count
+# NW_LAGS is intentionally UNUSED as of the Stage 5 fix below (kept only so any old
+# call site elsewhere that might still reference it does not raise NameError). Do not
+# pass max_lags=NW_LAGS to newey_west_ols() -- see the fix note in
+# _run_inline_factor_reg() for why (it silently produced a standard error that did
+# not match the canonical identification_battery.py / robustness_diagnostics.py /
+# exclude_amazon_robustness.py baseline, even though the coefficient matched).
 NW_LAGS = 4
+
+# Months per year (annualization factor) -- used by Figure 11's risk-comparison bars.
+# Previously defined inline inside the old Table 7 _risk_row() helper; restored here
+# as a module-level constant now that Table 7 has been rebuilt from
+# performance_metrics.py and no longer defines it.
+_MONTHS_PER_YEAR = 12
 
 
 def _run_inline_factor_reg(port_ts, ff_factors_df):
@@ -445,11 +433,20 @@ def _run_inline_factor_reg(port_ts, ff_factors_df):
     port.index = pd.to_datetime(port.index).to_period('M').to_timestamp('M')
 
     results = {}
-    portfolio_cols = [c for c in ['Q1', 'Q2', 'Q3', 'Q4', 'Q1-Q4'] if c in port.columns]
+    # BUG FIX (Stage 5): this list used to be hardcoded to ['Q1','Q2','Q3','Q4','Q1-Q4'],
+    # so any caller with a differently-named portfolio set (e.g. port_placebo_m, whose
+    # columns are High/Low/High-Low) silently matched NOTHING and got an empty
+    # `results` dict back -- no error, but _build_panel_table() then rendered every
+    # cell blank for that table. Auto-detect instead: every column except MKT is a
+    # portfolio to regress. Verified this is equivalent to the old hardcoded list for
+    # every existing Q1/Q2/Q3/Q4/Q1-Q4/MKT caller.
+    portfolio_cols = [c for c in port.columns if c != 'MKT']
 
     for port_col in portfolio_cols:
-        # For individual portfolios subtract RF to get excess return; long-short is already zero-cost
-        if port_col == 'Q1-Q4':
+        # For individual (single-leg) portfolios subtract RF to get excess return;
+        # long-short / zero-cost spreads (name contains '-', e.g. 'Q1-Q4', 'High-Low')
+        # are already zero-cost and must NOT have RF subtracted.
+        if '-' in port_col:
             y_raw = port[port_col]
         else:
             rf_aligned = ff_factors_df['RF'].reindex(port.index)
@@ -465,7 +462,18 @@ def _run_inline_factor_reg(port_ts, ff_factors_df):
             y = combined.iloc[:, 0]
             X = combined.iloc[:, 1:]
 
-            ols_result = newey_west_ols(y, X, max_lags=NW_LAGS)
+            # BUG FIX (Stage 5): this used to pass max_lags=NW_LAGS (hardcoded to 4),
+            # but analysis_v2.py's own run_factor_regressions() -- the function
+            # identification_battery.py / robustness_diagnostics.py /
+            # exclude_amazon_robustness.py all use for the canonical baseline -- calls
+            # newey_west_ols(y, X) with NO max_lags, letting it fall through to the
+            # Newey-West (1994) automatic-bandwidth rule (4*(T/100)**(2/9), which
+            # evaluates to 3 for this sample's N). The hardcoded 4 produced a alpha
+            # that matched the canonical baseline exactly but a standard error that
+            # quietly did not (e.g. baseline ADJ RRR FF3: SE=0.6433 here vs the
+            # canonical 0.6533 / t=2.94 confirmed across all four locked scripts).
+            # Not passing max_lags reproduces the canonical SE exactly.
+            ols_result = newey_west_ols(y, X)
             params = ols_result.params
             tvals  = ols_result.tvalues
             pvals  = ols_result.pvalues
@@ -522,7 +530,20 @@ def _build_panel_table(reg_results, port_labels, note_text):
         'FF5':     'Fama--French Five-Factor Model',
     }
 
+    # House style / project convention (CLAUDE.md "Storage" rule, confirmed against
+    # every section file's own `\begin{table}[htbp]\caption{}\label{}\input{...}
+    # \end{table}` wrapper): each tables/tab_*.tex fragment is self-contained
+    # threeparttable + tabular + tablenotes ONLY -- no outer `table` float, no
+    # \caption/\label (those live in the section file, one level up). This matches
+    # every existing on-disk table in this project. Do not add a `table` float or
+    # \caption/\label here -- it would nest a second `table` environment inside the
+    # section file's own float once Stage 6 wires these in, which LaTeX does not
+    # support (this is also why this function does NOT call the global
+    # export_custom_table() -- that helper bundles its own `table` float, which
+    # would conflict with this project's structure).
     lines = []
+    lines.append('\\begin{threeparttable}')
+    lines.append('\\footnotesize')
     lines.append(f'\\begin{{tabular}}{{{col_spec}}}')
     lines.append('\\toprule')
     lines.append(header_str + ' \\\\')
@@ -536,27 +557,35 @@ def _build_panel_table(reg_results, port_labels, note_text):
             f'{{\\textbf{{{panel_titles[model]}}}}} \\\\'
         )
         lines.append('\\midrule')
-        # Repeat portfolio header row so each model block is self-contained
-        lines.append(header_str + ' \\\\')
+        # NOTE: the portfolio header row (Q1/Q2/.../Q1-Q4) is NOT repeated here.
+        # A single header row lives once at the top of the table (see above). Repeating
+        # it after every panel title used to produce a duplicate-header-row bug that was
+        # already flagged and fixed by hand in the committed .tex files; do not
+        # reintroduce it here.
 
-        # Alpha row
+        # Alpha row: coefficient / SE / exact p-value (3 rows, no stars -- house style)
         alpha_cells = []
         se_alpha_cells = []
+        p_alpha_cells = []
         for port in port_labels:
             key = f'{port}_{model}'
             if key in reg_results:
                 r = reg_results[key]
                 a_pct = r['alpha'] * 100     # convert to %/month
                 se_pct = r['se_alpha'] * 100
-                alpha_cells.append(_fmt_coef(a_pct, r['alpha_p']))
+                alpha_cells.append(_fmt_coef(a_pct))
                 se_alpha_cells.append(_fmt_se(se_pct))
+                p_alpha_cells.append(_fmt_pval(r['alpha_p']))
             else:
                 alpha_cells.append('')
                 se_alpha_cells.append('')
+                p_alpha_cells.append('')
         lines.append('  $\\alpha$ (\\%/mo) & ' + ' & '.join(alpha_cells) + ' \\\\')
         lines.append('  & ' + ' & '.join(se_alpha_cells) + ' \\\\')
+        lines.append('  & ' + ' & '.join(p_alpha_cells) + ' \\\\')
 
-        # Factor beta rows
+        # Factor beta rows (coefficient / SE only, no p-value row -- matches the
+        # existing convention where only the focal alpha gets an exact p-value row)
         for factor in active_factors:
             beta_cells = []
             se_beta_cells = []
@@ -564,10 +593,9 @@ def _build_panel_table(reg_results, port_labels, note_text):
                 key = f'{port}_{model}'
                 b_key = f'beta_{factor}'
                 s_key = f'se_{factor}'
-                p_key = f'pval_{factor}'
                 if key in reg_results and b_key in reg_results[key]:
                     r = reg_results[key]
-                    beta_cells.append(_fmt_coef(r[b_key], r[p_key]))
+                    beta_cells.append(_fmt_coef(r[b_key]))
                     se_beta_cells.append(_fmt_se(r[s_key]))
                 else:
                     beta_cells.append('')
@@ -593,8 +621,11 @@ def _build_panel_table(reg_results, port_labels, note_text):
 
     lines.append('\\bottomrule')
     lines.append('\\end{tabular}')
-    lines.append('\\vspace{2pt}')
-    lines.append(f'{{{note_text}}}')
+    lines.append('\\begin{tablenotes}')
+    lines.append('\\small')
+    lines.append(f'\\item {note_text}')
+    lines.append('\\end{tablenotes}')
+    lines.append('\\end{threeparttable}')
     return lines
 
 
@@ -612,11 +643,6 @@ _THREE_MODEL_NCOLS = 4   # label + 3 model columns
 # ============================================================================
 print("\n[Table 1] Summary statistics...")
 
-_tab1_lines = []
-_tab1_lines.append('\\begin{tabular}{lrrrrrrrr}')
-_tab1_lines.append('\\toprule')
-_tab1_lines.append('Variable & N & Mean & Median & SD & P10 & P25 & P75 & P90 \\\\')
-_tab1_lines.append('\\midrule')
 def _latex_escape_row(s):
     """Escape % and replace leading - with $-$ in table cells."""
     s = s.replace('%', '\\%')
@@ -627,23 +653,40 @@ def _latex_escape_row(s):
     s = re.sub(r'(?<=& )-(\d)', r'$-$\1', s)
     return s
 
+# House style: dollar-magnitude columns get 2 decimal places; every rate/ratio
+# column gets 4 (style_guide.md; feedback_decimal_places_dollar_columns.md). Assets,
+# Market Cap and Revenue are the only dollar-magnitude variables in pooled_desc.
+_DOLLAR_VARS = {'Assets', 'Market Cap', 'Revenue'}
+
+_tab1_lines = []
+_tab1_lines.append('\\begin{threeparttable}')
+_tab1_lines.append('\\footnotesize')
+_tab1_lines.append('\\begin{tabular}{lrrrrrrrr}')
+_tab1_lines.append('\\toprule')
+_tab1_lines.append('Variable & N & Mean & Median & SD & P10 & P25 & P75 & P90 \\\\')
+_tab1_lines.append('\\midrule')
+
 for _, r in pooled_desc.iterrows():
+    _dp = 2 if r['Variable'] in _DOLLAR_VARS else 4
     _row = (
-        f"{r['Variable']} & {fmt_int(r['N'])} & {fmt(r['Mean'],2)} & "
-        f"{fmt(r['Median'],2)} & {fmt(r['SD'],2)} & {fmt(r['P10'],2)} & "
-        f"{fmt(r['P25'],2)} & {fmt(r['P75'],2)} & {fmt(r['P90'],2)} \\\\"
+        f"{r['Variable']} & {fmt_int(r['N'])} & {fmt(r['Mean'],_dp)} & "
+        f"{fmt(r['Median'],_dp)} & {fmt(r['SD'],_dp)} & {fmt(r['P10'],_dp)} & "
+        f"{fmt(r['P25'],_dp)} & {fmt(r['P75'],_dp)} & {fmt(r['P90'],_dp)} \\\\"
     )
     _tab1_lines.append(_latex_escape_row(_row))
 _tab1_lines.append('\\bottomrule')
 _tab1_lines.append('\\end{tabular}')
-_tab1_lines.append('\\vspace{2pt}')
+_tab1_lines.append('\\begin{tablenotes}')
+_tab1_lines.append('\\small')
 _tab1_lines.append(
-    r'{\footnotesize\textit{Note: '
-    r'Pooled summary statistics for the 124 sample firms over 2017Q1--2024Q3. '
-    r'RRR, AR, and Revenue Growth are expressed as percentages. '
-    r'Market Cap is in millions of USD. BTM is book-to-market ratio. '
-    r'PM is operating profit margin (\%).}}'
+    r'\item \textit{Notes:} Pooled summary statistics for the 124 sample firms over '
+    r'2017Q1--2024Q3. RRR, AR, and Revenue Growth are expressed as percentages. '
+    r'Assets, Market Cap and Revenue are in millions of USD (2 decimal places); all '
+    r'other statistics are rates or ratios (4 decimal places). BTM is book-to-market '
+    r'ratio. PM is operating profit margin (\%).'
 )
+_tab1_lines.append('\\end{tablenotes}')
+_tab1_lines.append('\\end{threeparttable}')
 _write_tabular(_tab1_lines, os.path.join(TABLE_DIR, 'tab_summary_stats.tex'))
 
 
@@ -653,6 +696,7 @@ _write_tabular(_tab1_lines, os.path.join(TABLE_DIR, 'tab_summary_stats.tex'))
 print("[Table 2] Sample composition...")
 
 _tab2_lines = []
+_tab2_lines.append('\\begin{threeparttable}')
 _tab2_lines.append('\\resizebox{\\textwidth}{!}{%')
 _tab2_lines.append('\\begin{tabular}{llrrrrrrrr}')
 _tab2_lines.append('\\toprule')
@@ -669,24 +713,34 @@ for _s_idx, _sector in enumerate(_sectors):
         _sec_cell = f'\\textbf{{{_sector}}} ({_n_firms} firms)' if _first else ''
         _first = False
         _metric = str(_r['Metric']).replace('%', '\\%')
-        _tab2_lines.append(
+        # All columns here are percentage rates (RG/AR/RRR) -- 4dp per house style
+        # (no dollar-magnitude columns in this table). Row is run through
+        # _latex_escape_row() so negative values render with the proper math-mode
+        # minus sign ($-$), matching every other table -- the pre-Stage-5 code this
+        # block was based on built the row string directly without that step, which
+        # would have left negative cells (e.g. Industrials RG median) with a plain
+        # text hyphen instead.
+        _row = (
             f"{_sec_cell} & {_metric} & {fmt_int(_r['N'])} & "
-            f"{fmt(_r['Mean'],2)} & {fmt(_r['Median'],2)} & {fmt(_r['SD'],2)} & "
-            f"{fmt(_r['P10'],2)} & {fmt(_r['P25'],2)} & {fmt(_r['P75'],2)} & "
-            f"{fmt(_r['P90'],2)} \\\\"
+            f"{fmt(_r['Mean'],4)} & {fmt(_r['Median'],4)} & {fmt(_r['SD'],4)} & "
+            f"{fmt(_r['P10'],4)} & {fmt(_r['P25'],4)} & {fmt(_r['P75'],4)} & "
+            f"{fmt(_r['P90'],4)} \\\\"
         )
+        _tab2_lines.append(_latex_escape_row(_row))
     if _s_idx < len(_sectors) - 1:
         _tab2_lines.append('\\midrule')
 _tab2_lines.append('\\bottomrule')
 _tab2_lines.append('\\end{tabular}%')
 _tab2_lines.append('}')
-_tab2_lines.append('\\vspace{2pt}')
+_tab2_lines.append('\\begin{tablenotes}')
+_tab2_lines.append('\\small')
 _tab2_lines.append(
-    r'{\footnotesize\textit{Note: '
-    r'Number of firms and descriptive statistics for Revenue Growth (RG), '
-    r'Acquisition Rate (AR), and Revenue Retention Rate (RRR) by GICS sector. '
-    r'All values in percentages.}}'
+    r'\item \textit{Notes:} Number of firms and descriptive statistics for Revenue '
+    r'Growth (RG), Acquisition Rate (AR), and Revenue Retention Rate (RRR) by GICS '
+    r'sector. All values in percentages.'
 )
+_tab2_lines.append('\\end{tablenotes}')
+_tab2_lines.append('\\end{threeparttable}')
 _write_tabular(_tab2_lines, os.path.join(TABLE_DIR, 'tab_sample_composition.tex'))
 
 
@@ -706,14 +760,14 @@ _rrr_port_labels = ['Q1', 'Q2', 'Q3', 'Q4', 'Q1-Q4']
 _tab3a_note = (
     r'\textit{Note: Value-weighted raw RRR quartile portfolio factor regressions. '
     r'Q1 = highest RRR, Q4 = lowest RRR, Q1$-$Q4 = long-short. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 _tab3b_note = (
     r'\textit{Note: Value-weighted industry-time-adjusted RRR quartile portfolio factor regressions. '
     r'Q1 = highest adjusted RRR, Q4 = lowest adjusted RRR, Q1$-$Q4 = long-short. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 
 print("  Computing RRR regressions (raw)...")
@@ -742,14 +796,14 @@ _ar_port_labels = ['Q1', 'Q2', 'Q3', 'Q4', 'Q1-Q4']
 _tab4a_ar_note = (
     r'\textit{Note: Value-weighted raw AR quartile portfolio factor regressions. '
     r'Q1 = highest AR, Q4 = lowest AR, Q1$-$Q4 = long-short. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 _tab4b_ar_note = (
     r'\textit{Note: Value-weighted industry-time-adjusted AR quartile portfolio factor regressions. '
     r'Q1 = highest adjusted AR, Q4 = lowest adjusted AR, Q1$-$Q4 = long-short. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 
 print("  Computing AR regressions (raw)...")
@@ -791,11 +845,30 @@ _fmb_var_labels = {
 _n_fmb_cols = len(_fmb_specs)
 _fmb_col_labels = [f'({i+1})' for i in range(_n_fmb_cols)]
 _fmb_col_spec = 'l' + 'c' * _n_fmb_cols
+
+# Group header: "Adjusted signal" vs "Raw signal", spanning however many consecutive
+# columns share a group (run-length encoded so this does not hardcode a 2+2 split).
+_fmb_group_labels = ['Adjusted signal' if 'Adj' in _s else 'Raw signal' for _s in _fmb_specs]
+_fmb_groups = []  # list of (label, span)
+for _lbl in _fmb_group_labels:
+    if _fmb_groups and _fmb_groups[-1][0] == _lbl:
+        _fmb_groups[-1] = (_lbl, _fmb_groups[-1][1] + 1)
+    else:
+        _fmb_groups.append((_lbl, 1))
+_fmb_group_row = ['']
+_fmb_cmidrules = []
+_col = 2  # first data column in LaTeX 1-indexing (col 1 is the row-label column)
+for _lbl, _span in _fmb_groups:
+    _fmb_group_row.append(f'\\multicolumn{{{_span}}}{{c}}{{{_lbl}}}')
+    _fmb_cmidrules.append(f'\\cmidrule(lr){{{_col}-{_col + _span - 1}}}')
+    _col += _span
 _fmb_header = ' & '.join([''] + _fmb_col_labels)
 
 _tab6_lines = []
 _tab6_lines.append(f'\\begin{{tabular}}{{{_fmb_col_spec}}}')
 _tab6_lines.append('\\toprule')
+_tab6_lines.append(' & '.join(_fmb_group_row) + ' \\\\')
+_tab6_lines.append(''.join(_fmb_cmidrules))
 _tab6_lines.append(_fmb_header + ' \\\\')
 _tab6_lines.append('\\midrule')
 
@@ -804,21 +877,27 @@ for _var in _fmb_vars_order:
     _display = _fmb_var_labels.get(_var, _var.replace('_', '\\_'))
     _coef_cells = []
     _se_cells = []
+    _p_cells = []
     for _spec in _fmb_specs:
         _sv = _var_data[_var_data['Spec'] == _spec]
         if len(_sv) > 0:
             _c = _sv.iloc[0]['Coefficient']
             _t = _sv.iloc[0]['t-stat']
-            # Derive p-value from t-stat (two-tailed normal approximation)
+            # Derive p-value from t-stat (two-tailed normal approximation; the FMB
+            # coefficients here are time-series averages with Newey-West t-stats, so a
+            # normal reference distribution is the standard choice).
             _p = 2 * _scipy_stats.norm.sf(abs(_t))
             _se = _se_from_t(_c, _t)
-            _coef_cells.append(_fmt_coef(_c, _p))
+            _coef_cells.append(_fmt_coef(_c))
             _se_cells.append(_fmt_se(_se) if not np.isnan(_se) else '')
+            _p_cells.append(_fmt_pval(_p))
         else:
             _coef_cells.append('')
             _se_cells.append('')
+            _p_cells.append('')
     _tab6_lines.append(f'  {_display} & ' + ' & '.join(_coef_cells) + ' \\\\')
     _tab6_lines.append('  \\quad & ' + ' & '.join(_se_cells) + ' \\\\')
+    _tab6_lines.append('  \\quad & ' + ' & '.join(_p_cells) + ' \\\\')
 
 # Summary rows: T (quarters) and Avg N
 _tab6_lines.append('\\midrule')
@@ -841,74 +920,92 @@ _tab6_lines.append('\\vspace{2pt}')
 _tab6_lines.append(
     r'{\footnotesize\textit{Note: Time-series averages of quarterly cross-sectional regression coefficients '
     r'(Fama-MacBeth). Dependent variable: average monthly excess return in quarter $t+1$. '
-    r'Columns (1)--(4) use industry-time-adjusted signals; columns (5)--(8) use raw signals. '
-    r'SEs in parentheses (Newey-West, 4 lags). $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}}'
+    r'Columns (1)--(2) use the industry-time-adjusted \RRR{} signal; columns (3)--(4) use the raw \RRR{} signal. '
+    r'Controls (column 2 and 4) are lagged one quarter: Size = log market capitalization, '
+    r'BTM = book-to-market, Profit Margin = operating income / revenue. '
+    r'Standard errors in parentheses (Newey-West, 4 lags); exact $p$-values in brackets. '
+    r'No significance stars are used.}}'
 )
 _write_tabular(_tab6_lines, os.path.join(TABLE_DIR, 'tab_fmb.tex'))
 
 
 # ============================================================================
-# TABLE 7: Risk Statistics — Quartile portfolios (unchanged)
+# TABLE 7 (Stage 5 REPLACEMENT): Performance / Risk Metrics — full battery
 # ============================================================================
-print("[Table 7] Risk statistics...")
+# Author decision (Stage 5): performance_metrics.py's numbers are authoritative for
+# this table, not an inline recomputation. performance_metrics.py was purpose-built
+# for this paper with explicit, documented metric choices (sample's own market
+# portfolio as the benchmark rather than FF Mkt-RF; a stricter textbook Sortino
+# definition than what's used elsewhere in the repo, by deliberate design) and has
+# already been independently verified bit-identical to the main portfolio
+# construction. The PRIOR version of this table (kept in git history) recomputed
+# these statistics inline from port_rrr_q using cumsum()-based drawdown, which
+# silently assumed LOG returns; that assumption stopped holding once Step 0b above
+# switched portfolio construction to SIMPLE returns (build_portfolio_returns()),
+# so the inline version was quietly wrong for Max Drawdown / cumulative-return-based
+# statistics. Retired in favor of reading the already-computed, already-verified
+# battery below. Same output filename (tab_risk_stats.tex) is kept so the existing
+# \input{tables/tab_risk_stats} in 06_results.tex continues to work unmodified.
+print("[Table 7] Performance / risk metrics battery (performance_metrics.py)...")
 
-# Build quartile-level risk statistics from the port_rrr_q time series
-_MONTHS_PER_YEAR = 12
+_perf_metrics = pd.read_excel(
+    os.path.join(OUTPUT_DIR, 'performance_metrics_summary.xlsx'), sheet_name='Metrics'
+).set_index('Unnamed: 0')
+_perf_cols = ['Q1', 'Q2', 'Q3', 'Q4', 'Q1-Q4', 'MKT']
 
-def _risk_row(ret_series, label):
-    """Compute annualized risk metrics for a return series (log monthly returns)."""
-    r = ret_series.dropna()
-    ann_ret = r.mean() * _MONTHS_PER_YEAR * 100
-    ann_vol = r.std() * np.sqrt(_MONTHS_PER_YEAR) * 100
-    sharpe = (r.mean() / r.std() * np.sqrt(_MONTHS_PER_YEAR)) if r.std() > 0 else np.nan
-    # Maximum drawdown on cumulative log-return series
-    cumret = r.cumsum()
-    rolling_max = cumret.cummax()
-    drawdown = (cumret - rolling_max) * 100
-    max_dd = drawdown.min()
-    # Downside beta: beta vs market on negative-market months
-    mkt_aligned = port_rrr_q['MKT'].reindex(r.index).dropna()
-    r_aligned = r.reindex(mkt_aligned.index)
-    neg_mkt = mkt_aligned[mkt_aligned < 0]
-    r_neg = r_aligned.reindex(neg_mkt.index)
-    if len(r_neg) > 5 and neg_mkt.std() > 0:
-        downside_beta = np.cov(r_neg.values, neg_mkt.values)[0, 1] / neg_mkt.var()
-    else:
-        downside_beta = np.nan
-    # Sortino ratio (downside deviation using 0 as threshold)
-    downside_ret = r[r < 0]
-    downside_dev = np.sqrt((downside_ret ** 2).mean()) * np.sqrt(_MONTHS_PER_YEAR)
-    sortino = (r.mean() * _MONTHS_PER_YEAR / downside_dev) if downside_dev > 0 else np.nan
-    var5 = np.percentile(r, 5) * 100
-    skew = r.skew()
-    hit = (r > 0).mean() * 100
-    return [label, fmt(ann_ret, 2), fmt(ann_vol, 2), fmt(sharpe, 4),
-            fmt(max_dd, 2), fmt(downside_beta, 4), fmt(sortino, 4),
-            fmt(var5, 2), fmt(skew, 4), fmt(hit, 1)]
+# (row label in source, display label, decimal places, suffix)
+_perf_rows_spec = [
+    ('Ann Return (%)',          'Ann.\\ Return',        2, '\\%'),
+    ('Ann Vol (%)',             'Ann.\\ Volatility',    2, '\\%'),
+    ('Sharpe Ratio',            'Sharpe Ratio',         4, ''),
+    ('Sortino Ratio',           'Sortino Ratio',        4, ''),
+    ('Tracking Error (%)',      'Tracking Error',       2, '\\%'),
+    ('Information Ratio',       'Information Ratio',    4, ''),
+    ('Downside Beta',           'Downside $\\beta$',    4, ''),
+    ('Upside Beta',             'Upside $\\beta$',      4, ''),
+    ('Max Drawdown (%)',        'Max Drawdown',         2, '\\%'),
+    ('Turnover (avg qtrly, %)', 'Turnover (qtrly avg)', 2, '\\%'),
+    ('Hit Rate vs Market (%)',  'Hit Rate vs.\\ Market',1, '\\%'),
+    ('Hit Rate vs Q4 (%)',      'Hit Rate vs.\\ Q4',    1, '\\%'),
+]
 
 _tab7_lines = []
-_tab7_lines.append('\\begin{tabular}{lrrrrrrrrrr}')
+_tab7_lines.append('\\begin{threeparttable}')
+_tab7_lines.append('\\resizebox{\\textwidth}{!}{%')
+_tab7_lines.append('\\begin{tabular}{lrrrrrr}')
 _tab7_lines.append('\\toprule')
-_tab7_lines.append(
-    'Portfolio & Ret (\\%) & Vol (\\%) & Sharpe & MDD (\\%) & '
-    'Down $\\beta$ & Sortino & VaR$_{5\\%}$ & Skew & Hit (\\%) \\\\'
-)
+_tab7_lines.append(' & ' + ' & '.join(_perf_cols) + ' \\\\')
 _tab7_lines.append('\\midrule')
-
-# Use port_rrr_q (quartile portfolios built in Step 0b)
-for _port_col in ['Q1', 'Q2', 'Q3', 'Q4', 'Q1-Q4', 'MKT']:
-    if _port_col in port_rrr_q.columns:
-        _tab7_lines.append(' & '.join(_risk_row(port_rrr_q[_port_col], _port_col)) + ' \\\\')
-
+for _src_label, _disp_label, _dp, _suffix in _perf_rows_spec:
+    _cells = []
+    for _c in _perf_cols:
+        _v = _perf_metrics.loc[_src_label, _c]
+        _cells.append(fmt(_v, _dp) + _suffix if pd.notna(_v) else '')
+    _row = f'{_disp_label} & ' + ' & '.join(_cells) + ' \\\\'
+    _tab7_lines.append(_latex_escape_row(_row))
+_tab7_lines.append('\\midrule')
+_n_cells = [fmt_int(_perf_metrics.loc['N (months)', _c]) for _c in _perf_cols]
+_tab7_lines.append('$N$ (months) & ' + ' & '.join(_n_cells) + ' \\\\')
 _tab7_lines.append('\\bottomrule')
-_tab7_lines.append('\\end{tabular}')
-_tab7_lines.append('\\vspace{2pt}')
+_tab7_lines.append('\\end{tabular}%')
+_tab7_lines.append('}')
+_tab7_lines.append('\\begin{tablenotes}')
+_tab7_lines.append('\\small')
 _tab7_lines.append(
-    r'{\footnotesize\textit{Note: Annualized risk statistics for value-weighted RRR quartile portfolios '
-    r'(industry-time adjusted signal). Q1 = high RRR, Q4 = low RRR, Q1-Q4 = long-short. '
-    r'MDD = maximum drawdown. Down $\beta$ = beta on negative-market months. '
-    r'VaR$_{5\%}$ = 5th percentile monthly return. Hit = fraction of positive months.}}'
+    r'\item \textit{Notes:} Full performance/risk battery for value-weighted adjusted-\RRR{} '
+    r'quartile portfolios (source: performance\_metrics.py). Q1 = highest \RRR{}, Q4 = lowest, '
+    r'Q1$-$Q4 = long-short, MKT = the sample'"'"'s own value-weighted market portfolio (not FF Mkt-RF). '
+    r'Tracking Error and Information Ratio are computed against MKT. Downside/Upside Beta are betas on '
+    r'MKT estimated only in months MKT fell/rose, respectively. Sortino Ratio uses a strict textbook '
+    r'downside-deviation definition (0\% threshold), which need not numerically match Sortino figures '
+    r'computed elsewhere in the underlying codebase under a different convention. '
+    r'Hit Rate vs.\ Q4 reports, for each column portfolio, the fraction of months it outperforms Q4 '
+    r'(trivially 0\% in the Q4 column itself; not meaningfully defined for the Q1$-$Q4 spread, shown '
+    r'blank). Turnover is 0.5 $\times$ the sum of absolute formation-weight changes at each quarterly '
+    r're-formation.'
 )
+_tab7_lines.append('\\end{tablenotes}')
+_tab7_lines.append('\\end{threeparttable}')
 _write_tabular(_tab7_lines, os.path.join(TABLE_DIR, 'tab_risk_stats.tex'))
 
 
@@ -926,22 +1023,22 @@ _tab8_note = (
     r'Q1 = highest RRR, Q4 = lowest RRR, Q1$-$Q4 = long-short. '
     r'Panel A excludes 2020Q1--2021Q2 (COVID period). '
     r'Panel B uses equal-weighted returns. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 
 _tab_nc_note = (
     r'\textit{Note: Excluding COVID-19 period (2020Q1--2021Q2). '
     r'Value-weighted adjusted RRR quartile portfolios. '
     r'Q1 = highest RRR, Q4 = lowest RRR, Q1$-$Q4 = long-short. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 _tab_ew_note = (
     r'\textit{Note: Equal-weighted adjusted RRR quartile portfolios. '
     r'Q1 = highest RRR, Q4 = lowest RRR, Q1$-$Q4 = long-short. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 
 print("  Computing no-COVID robustness regressions...")
@@ -971,8 +1068,8 @@ _tab_pl_note = (
     r'All firms have similarly high headline growth; the sort isolates revenue composition. '
     r'High = above-median RRR, Low = below-median RRR, High$-$Low = long-short. '
     rf'Average group size is approximately {_pl_avg_firms} firms per quarter. '
-    r'OLS with Newey-West standard errors (4 lags). '
-    r'SEs in parentheses. $^{***}p<0.01$, $^{**}p<0.05$, $^{*}p<0.10$.}'
+    r'OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). '
+    r'Standard errors in parentheses; exact $p$-values in brackets for alpha estimates. No significance stars are used.}'
 )
 
 print("  Computing placebo regressions...")
@@ -983,7 +1080,914 @@ _write_tabular(
     os.path.join(TABLE_DIR, 'tab_placebo.tex')
 )
 
-print("\n  All 8 tables generated.")
+print("\n  8 legacy tables regenerated under corrected timing.")
+
+
+# ============================================================================
+# STAGE 5: CANONICAL-RUN TABLE REBUILD
+# ----------------------------------------------------------------------------
+# Everything below is new for Stage 5 (canonical-run rebuild / house-style pass).
+# All tables below are pulled from the already-committed, already-run output of
+# identification_battery.py, robustness_diagnostics.py, exclude_amazon_robustness.py,
+# future_beta_retry.py and performance_metrics.py -- no analysis is recomputed here,
+# only read, reorganized and formatted. Where a script's own committed .xlsx omits a
+# figure it demonstrably computed (found during this stage; see
+# canonical_run_manifest.json and the per-table notes below), the figure is taken
+# from a clean, verified re-run of the UNMODIFIED script's console output rather than
+# either recomputing it differently or silently dropping it.
+# ============================================================================
+
+def _xlsx_to_reg_results(df):
+    """Convert a factor-regression xlsx already on the _build_panel_table() key
+    convention (first column holds keys like 'Q1_FF3', 'Q1-Q4_FF5', ...; other
+    columns are alpha/alpha_t/alpha_p/se_alpha/r2/n_obs/beta_<factor>/se_<factor>/
+    tstat_<factor>/pval_<factor>) into the same {key: {...}} dict shape
+    _build_panel_table() expects, so xlsx output already produced by the locked
+    analysis scripts can be rendered with the exact same table-building code used
+    for the portfolios computed inline in this script."""
+    key_col = df.columns[0]
+    results = {}
+    for _, row in df.iterrows():
+        entry = {
+            'alpha': row['alpha'], 'alpha_t': row['alpha_t'], 'alpha_p': row['alpha_p'],
+            'se_alpha': row['se_alpha'], 'r2': row['r2'], 'n_obs': row['n_obs'],
+        }
+        for factor in FACTOR_ORDER:
+            beta_col = f'beta_{factor}'
+            if beta_col in df.columns and pd.notna(row[beta_col]):
+                entry[f'beta_{factor}'] = row[beta_col]
+                entry[f'se_{factor}'] = row[f'se_{factor}']
+        results[row[key_col]] = entry
+    return results
+
+
+DIAG_XLSX = os.path.join(OUTPUT_DIR, 'robustness_diagnostics.xlsx')
+IDBAT_XLSX = os.path.join(OUTPUT_DIR, 'identification_battery.xlsx')
+
+
+# ============================================================================
+# TABLE: Portfolio Characteristics (reuse — was orphaned; portfolio_char_xlsx was
+# already loaded at Step 0 but never used by any table below it)
+# ============================================================================
+print("[Table] Portfolio characteristics (fixing precision: dollar cols 2dp, rate/ratio cols 4dp)...")
+
+_pc = portfolio_char_xlsx.set_index('Quartile')
+_PC_DOLLAR_COLS = ['Revenue (M)', 'Market Cap (M)']
+_PC_RATE_COLS = ['Rev Growth (%)', 'SoNR (%)', 'RRR (%)', 'BTM', 'Op. ROA (%)']
+
+_tab_pc_lines = []
+_tab_pc_lines.append('\\begin{threeparttable}')
+_tab_pc_lines.append('\\footnotesize')
+_tab_pc_lines.append('\\setlength{\\tabcolsep}{4pt}')
+_tab_pc_lines.append('\\begin{tabular}{lrrrrrrrr}')
+_tab_pc_lines.append('\\toprule')
+_tab_pc_lines.append(
+    'Quartile & Avg $N$ & Revenue (M) & Mkt Cap (M) & Rev Growth (\\%) & SoNR (\\%) & RRR (\\%) & BTM & Op.\\ ROA (\\%) \\\\'
+)
+_tab_pc_lines.append('\\midrule')
+for _q in ['Q1', 'Q2', 'Q3', 'Q4']:
+    _r = _pc.loc[_q]
+    _qlabel = f'{_q} (High RRR)' if _q == 'Q1' else f'{_q} (Low RRR)' if _q == 'Q4' else _q
+    _cells = [fmt(_r['Avg N / quarter'], 1)]
+    _cells += [fmt(_r[_c], 2) for _c in _PC_DOLLAR_COLS]
+    _cells += [fmt(_r[_c], 4) for _c in _PC_RATE_COLS]
+    _tab_pc_lines.append(_latex_escape_row(f'{_qlabel} & ' + ' & '.join(_cells) + ' \\\\'))
+_diff = _pc.loc['Q1'] - _pc.loc['Q4']
+_diff_cells = [''] + [fmt(_diff[_c], 2) for _c in _PC_DOLLAR_COLS] + [fmt(_diff[_c], 4) for _c in _PC_RATE_COLS]
+_tab_pc_lines.append('\\midrule')
+_tab_pc_lines.append(_latex_escape_row('$Q1-Q4$ & ' + ' & '.join(_diff_cells) + ' \\\\'))
+_tab_pc_lines.append('\\bottomrule')
+_tab_pc_lines.append('\\end{tabular}')
+_tab_pc_lines.append('\\begin{tablenotes}')
+_tab_pc_lines.append('\\small')
+_tab_pc_lines.append(
+    r'\item \textit{Notes:} Time-series averages of cross-sectional mean characteristics for '
+    r'value-weighted industry-time-adjusted \RRR{} quartile portfolios. Q1 = highest adjusted \RRR{}, '
+    r'Q4 = lowest. Avg $N$ = average number of firms per quarter. Rev Growth = quarterly revenue growth '
+    r'rate (\%). SoNR = Share of New Revenue = '
+    r'$\text{Rev}^{\text{new}}_{i,t} / \text{Rev}_{i,t} \times 100$, the fraction of current-period '
+    r'revenue attributable to newly acquired customers (\%). BTM = (total assets $-$ total liabilities) '
+    r'/ market capitalization. Op.\ ROA = operating income / total assets (\%). Dollar-magnitude '
+    r'columns (Revenue, Market Cap) are reported to 2 decimal places; all rate and ratio columns to 4. '
+    r'The Q1$-$Q4 row reports the difference in cross-sectional means.'
+)
+_tab_pc_lines.append('\\end{tablenotes}')
+_tab_pc_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_pc_lines, os.path.join(TABLE_DIR, 'tab_portfolio_characteristics.tex'))
+
+
+# ============================================================================
+# TABLE: Signal Persistence / Autocorrelation (reuse — matches task item 6:
+# firm-level AR(1) alongside the quartile transition-matrix diagonal)
+# ============================================================================
+print("[Table] Signal persistence & autocorrelation...")
+
+_sp_df = pd.read_excel(os.path.join(OUTPUT_DIR, 'signal_persistence_comparison.xlsx')).set_index('Metric')
+_SP_COLS = ['Raw RRR', 'Adj RRR', 'Raw AR', 'Adj AR']
+
+_tab_sp_lines = []
+_tab_sp_lines.append('\\begin{threeparttable}')
+_tab_sp_lines.append('\\resizebox{\\textwidth}{!}{%')
+_tab_sp_lines.append('\\begin{tabular}{lrrrr}')
+_tab_sp_lines.append('\\toprule')
+_tab_sp_lines.append(' & Raw \\RRR{} & Adj.\\ \\RRR{} & Raw \\AR{} & Adj.\\ \\AR{} \\\\')
+_tab_sp_lines.append('\\midrule')
+_tab_sp_lines.append(_latex_escape_row(
+    'Cross-sect SD (%/quarter) & ' +
+    ' & '.join(fmt(_sp_df.loc['Cross-sect SD (%/quarter)', c], 2) for c in _SP_COLS) + ' \\\\'
+))
+_tab_sp_lines.append('\\midrule')
+_tab_sp_lines.append('\\multicolumn{5}{l}{\\textit{Autocorrelation $\\mathrm{corr}(t,\\,t-k)$, firm-level Pearson}} \\\\')
+_AC_ROWS = [
+    ('Lag-1 corr mean', 'Lag $k=1$ mean', 4),
+    ('Lag-1 corr median', 'Lag $k=1$ median', 4),
+    ('Lag-1 % positive', 'Lag $k=1$ % pos.', 1),
+    ('Lag-4 corr mean', 'Lag $k=4$ mean', 4),
+    ('Lag-4 corr median', 'Lag $k=4$ median', 4),
+    ('Lag-4 % positive', 'Lag $k=4$ % pos.', 1),
+]
+for _metric, _label, _dp in _AC_ROWS:
+    _row = f'\\quad {_label} & ' + ' & '.join(fmt(_sp_df.loc[_metric, c], _dp) for c in _SP_COLS) + ' \\\\'
+    _tab_sp_lines.append(_latex_escape_row(_row))
+_tab_sp_lines.append('\\midrule')
+_tab_sp_lines.append('\\multicolumn{5}{l}{\\textit{Quartile stay-rate (fraction staying in same quartile, quarter to quarter)}} \\\\')
+_SR_ROWS = [
+    ('Overall stay-rate (%)', 'Overall'),
+    ('Q1 stay-rate (%)', 'Q1 (highest)'),
+    ('Q2 stay-rate (%)', 'Q2'),
+    ('Q3 stay-rate (%)', 'Q3'),
+    ('Q4 stay-rate (%)', 'Q4 (lowest)'),
+]
+for _metric, _label in _SR_ROWS:
+    _cells = ' & '.join(f"{_sp_df.loc[_metric, c]:.1f}\\%" for c in _SP_COLS)
+    _tab_sp_lines.append(f'\\quad {_label} & {_cells} \\\\')
+_tab_sp_lines.append('\\bottomrule')
+_tab_sp_lines.append('\\end{tabular}%')
+_tab_sp_lines.append('}')
+_tab_sp_lines.append('\\begin{tablenotes}')
+_tab_sp_lines.append('\\small')
+_tab_sp_lines.append(
+    r'\item \textit{Notes:} Source: analysis\_v2.py (signal\_persistence\_comparison.xlsx, '
+    r'quartile\_persistence.xlsx). Raw signals are unadjusted firm-level quarterly values; adjusted '
+    r'signals are demeaned within GICS sector $\times$ quarter. Cross-sectional SD is the time-series '
+    r'mean of the quarterly within-cross-section standard deviation. $\mathrm{corr}(t,\,t-k)$ is the '
+    r'firm-level Pearson correlation between the signal in quarter $t$ and quarter $t-k$ ($N=124$ '
+    r'firms); $k=4$ corresponds to the same calendar quarter one year prior. Lag-1 correlations are '
+    r'negative for all four signals (quarter-to-quarter mean-reversion); lag-4 correlations are '
+    r'positive for all four, with adjusted \RRR{} showing the highest annual persistence (mean '
+    r'$=0.444$). Quartile stay-rate is the fraction of firm-quarter transitions where a firm remains in '
+    r'the same quartile as the prior quarter (Q1 = highest signal, Q4 = lowest); the Q4 stay-rate is '
+    r'markedly higher than Q1--Q3 for both \RRR{} definitions, indicating the low-retention tail is the '
+    r'most persistent group.'
+)
+_tab_sp_lines.append('\\end{tablenotes}')
+_tab_sp_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_sp_lines, os.path.join(TABLE_DIR, 'tab_signal_persistence.tex'))
+
+
+# ============================================================================
+# TABLE: Robustness — Two-Quarter Lag (reuse — was orphaned; factor_reg_Lag2_adj.xlsx
+# refreshed in the prior commit but no code in this file rebuilt the .tex from it)
+# ============================================================================
+print("[Table] Robustness: two-quarter (extra formation-gap) lag...")
+
+_lag2_df = pd.read_excel(os.path.join(OUTPUT_DIR, 'factor_reg_Lag2_adj.xlsx'))
+_reg_lag2 = _xlsx_to_reg_results(_lag2_df)
+_tab_lag2_note = (
+    r'\textit{Notes:} Source: analysis\_v2.py (factor\_reg\_Lag2\_adj.xlsx). Returns measured in months '
+    r'$t+4$ through $t+6$ (an additional one-quarter formation gap beyond the main 2-month '
+    r'specification). Value-weighted industry-time-adjusted \RRR{} quartile portfolios. Q1 = highest '
+    r'adj.\ \RRR{}, Q4 = lowest, Q1$-$Q4 = long-short. All other construction is identical to the main '
+    r'specification. OLS with Newey-West standard errors (automatic bandwidth, Newey and West 1994). Standard errors in parentheses; '
+    r'exact $p$-values in brackets for alpha estimates. No significance stars are used.'
+)
+_write_tabular(
+    _build_panel_table(_reg_lag2, _rrr_port_labels, _tab_lag2_note),
+    os.path.join(TABLE_DIR, 'tab_robustness_lag2.tex')
+)
+
+
+# ============================================================================
+# TABLE (NEW, item 1): Headline Summary — ADJ RRR long-short + CAPM sample-market check
+# ============================================================================
+print("[Table] Headline summary (ADJ RRR long-short alpha + CAPM sample-market check)...")
+
+_capm = pd.read_excel(os.path.join(OUTPUT_DIR, 'capm_vs_sp500.xlsx')).iloc[0]
+_hl3, _hl5 = _reg_rrr_adj['Q1-Q4_FF3'], _reg_rrr_adj['Q1-Q4_FF5']
+
+_tab_hl_lines = []
+_tab_hl_lines.append('\\begin{threeparttable}')
+_tab_hl_lines.append('\\footnotesize')
+_tab_hl_lines.append('\\begin{tabular}{lrrr}')
+_tab_hl_lines.append('\\toprule')
+_tab_hl_lines.append(
+    '\\multicolumn{4}{l}{\\textbf{Panel A: Adjusted \\RRR{} Long-Short Portfolio (Q1$-$Q4, $k=2$-month formation lag)}} \\\\'
+)
+_tab_hl_lines.append('\\midrule')
+_tab_hl_lines.append(' & $\\alpha$ (\\%/mo) & $R^2$ & $N$ \\\\')
+_tab_hl_lines.append(f"FF3 & {_fmt_coef(_hl3['alpha']*100)} & {fmt(_hl3['r2'],4)} & {fmt_int(_hl3['n_obs'])} \\\\")
+_tab_hl_lines.append(f" & ({fmt(_hl3['se_alpha']*100,4)}) {_fmt_pval(_hl3['alpha_p'])} & & \\\\")
+_tab_hl_lines.append(f"FF5 & {_fmt_coef(_hl5['alpha']*100)} & {fmt(_hl5['r2'],4)} & {fmt_int(_hl5['n_obs'])} \\\\")
+_tab_hl_lines.append(f" & ({fmt(_hl5['se_alpha']*100,4)}) {_fmt_pval(_hl5['alpha_p'])} & & \\\\")
+_tab_hl_lines.append('\\midrule')
+_tab_hl_lines.append(
+    '\\multicolumn{4}{l}{\\textbf{Panel B: CAPM, Sample Value-Weighted Market vs.\\ S\\&P 500}} \\\\'
+)
+_tab_hl_lines.append('\\midrule')
+_tab_hl_lines.append(' & Coefficient & $t$-stat & \\\\')
+_tab_hl_lines.append(f"$\\alpha$ (\\%/mo) & {_fmt_coef(_capm['alpha_month']*100)} & ${fmt(_capm['alpha_t'],2)}$ & \\\\")
+_tab_hl_lines.append(f" & ({fmt(_capm['alpha_se']*100,4)}) & {_fmt_pval(_capm['alpha_p'])} & \\\\")
+_tab_hl_lines.append(f"$\\beta$ & {_fmt_coef(_capm['beta'])} & ${fmt(_capm['beta_t'],2)}$ & \\\\")
+_tab_hl_lines.append(f" & ({fmt(_capm['beta_se'],4)}) & & \\\\")
+_tab_hl_lines.append(f"$R^2$ & {fmt(_capm['r2'],4)} & & \\\\")
+_tab_hl_lines.append(f"$N$ (months) & {fmt_int(_capm['n_obs'])} & & \\\\")
+_tab_hl_lines.append('\\bottomrule')
+_tab_hl_lines.append('\\end{tabular}')
+_tab_hl_lines.append('\\begin{tablenotes}')
+_tab_hl_lines.append('\\small')
+_tab_hl_lines.append(
+    r'\item \textit{Notes:} Panel A source: analysis\_v2.py canonical portfolio pipeline '
+    r'(build\_holding\_panel $\to$ build\_portfolio\_returns $\to$ run\_factor\_regressions). '
+    r'Value-weighted, industry-time-adjusted \RRR{} quartile long-short portfolio, formed 2 months '
+    r'after quarter-end and held 3 months. OLS with Newey-West standard errors (automatic bandwidth, '
+    r'Newey and West 1994); standard '
+    r'errors in parentheses, exact $p$-values in brackets, no significance stars. '
+    r'Panel B source: analysis\_v2.py (capm\_vs\_sp500.xlsx). OLS of the sample'"'"'s own '
+    r'value-weighted market portfolio (excess return) on the S\&P 500 (excess return), Newey-West (HAC) '
+    r'standard errors, 4 lags; reported to verify the sample portfolio tracks a standard broad-market '
+    r'benchmark. The CAPM alpha is small and statistically indistinguishable from zero, as expected for '
+    r'a diversified market-cap-weighted benchmark portfolio; the beta is close to but somewhat above 1, '
+    r'consistent with the sample tilting toward a subset of (four) GICS sectors.'
+)
+_tab_hl_lines.append('\\end{tablenotes}')
+_tab_hl_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_hl_lines, os.path.join(TABLE_DIR, 'tab_headline_summary.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 2): QMJ / BAB Factor Regressions — the decisive confound test
+# ============================================================================
+print("[Table] QMJ / BAB factor regressions (identification_battery.py Task 1)...")
+
+_qmj_bab = pd.read_excel(IDBAT_XLSX, sheet_name='T1_QMJ_BAB')
+_QMJ_BAB_LABELS = {
+    'FF3 (ref)': 'FF3 (reference)', 'FF5 (ref)': 'FF5 (reference)',
+    'FF3+QMJ': 'FF3 + QMJ', 'FF5+QMJ': 'FF5 + QMJ',
+    'FF5+BAB': 'FF5 + BAB', 'FF5+QMJ+BAB': 'FF5 + QMJ + BAB',
+}
+_tab_qmj_lines = []
+_tab_qmj_lines.append('\\begin{threeparttable}')
+_tab_qmj_lines.append('\\footnotesize')
+_tab_qmj_lines.append('\\begin{tabular}{lrrrrr}')
+_tab_qmj_lines.append('\\toprule')
+_tab_qmj_lines.append('Specification & $\\alpha$ (\\%/mo) & $\\beta_{QMJ}$ & $\\beta_{BAB}$ & $R^2$ & $N$ \\\\')
+_tab_qmj_lines.append('\\midrule')
+for _, _r in _qmj_bab.iterrows():
+    _label = _QMJ_BAB_LABELS.get(_r['Spec'], _r['Spec'])
+    _qmj_cell = _fmt_coef(_r['beta_QMJ']) if pd.notna(_r['beta_QMJ']) else '--'
+    _bab_cell = _fmt_coef(_r['beta_BAB']) if pd.notna(_r['beta_BAB']) else '--'
+    _tab_qmj_lines.append(
+        f"{_label} & {_fmt_coef(_r['Alpha_pct_mo'])} & {_qmj_cell} & {_bab_cell} & "
+        f"{fmt(_r['R2'],4)} & {fmt_int(_r['N'])} \\\\"
+    )
+    _qmj_t = f"(${fmt(_r['t_QMJ'],2)}$)" if pd.notna(_r['t_QMJ']) else ''
+    _bab_t = f"(${fmt(_r['t_BAB'],2)}$)" if pd.notna(_r['t_BAB']) else ''
+    _tab_qmj_lines.append(f" & ({fmt(_r['Alpha_se_pct'],4)}) & {_qmj_t} & {_bab_t} & & \\\\")
+    _tab_qmj_lines.append(f" & {_fmt_pval(_r['Alpha_p'])} & & & & \\\\")
+_tab_qmj_lines.append('\\bottomrule')
+_tab_qmj_lines.append('\\end{tabular}')
+_tab_qmj_lines.append('\\begin{tablenotes}')
+_tab_qmj_lines.append('\\small')
+_qmj_bab_headline_t = _qmj_bab.loc[_qmj_bab['Spec'] == 'FF5+QMJ+BAB', 'Alpha_t'].values[0]
+_tab_qmj_lines.append(
+    r'\item \textit{Notes:} Source: identification\_battery.py Task 1. Value-weighted adjusted-\RRR{} '
+    r'long-short portfolio (Q1$-$Q4). QMJ = AQR Quality-Minus-Junk factor; BAB = AQR '
+    r'Betting-Against-Beta factor (both US, monthly). $\alpha$ row: standard error in parentheses '
+    r'below, exact $p$-value in brackets on the next row; no significance stars. $\beta_{QMJ}$/'
+    r'$\beta_{BAB}$ rows show $t$-statistics in parentheses (loadings are controls here, not the focal '
+    r'test). Decision rule (pre-registered): the long-short alpha survives this confound battery if '
+    r'the FF5+QMJ+BAB $\alpha$ $t$-statistic remains $\geq 2.0$; it does '
+    rf'($t={_qmj_bab_headline_t:.2f}$), so the RRR premium is not subsumed by quality or low-beta '
+    r'exposure.'
+)
+_tab_qmj_lines.append('\\end{tablenotes}')
+_tab_qmj_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_qmj_lines, os.path.join(TABLE_DIR, 'tab_qmj_bab.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 3): Consolidated Robustness Battery
+# ============================================================================
+print("[Table] Consolidated robustness battery...")
+
+_t2_boot = pd.read_excel(DIAG_XLSX, sheet_name='T2_Bootstrap')
+_t2_sub = pd.read_excel(DIAG_XLSX, sheet_name='T2_Subperiod')
+_t7_cost = pd.read_excel(DIAG_XLSX, sheet_name='T7_NetOfCost')
+
+# --- 4-quarter-trailing RRR (LR_RRR): port_lr_rrr_q was built in Step 0b above (the
+# comment there promises persistence to lr_rrr_robustness_stage5.xlsx) but was never
+# actually regressed or written -- completed here.
+print("  Computing 4-quarter-trailing RRR (LR_RRR) robustness regressions...")
+_reg_lr_rrr = _run_inline_factor_reg(port_lr_rrr_q, ff_factors)
+_lr_rrr_export_rows = [
+    {'key': _key, 'alpha': _r['alpha'], 'alpha_t': _r['alpha_t'], 'alpha_p': _r['alpha_p'],
+     'se_alpha': _r['se_alpha'], 'r2': _r['r2'], 'n_obs': _r['n_obs']}
+    for _key, _r in _reg_lr_rrr.items()
+]
+pd.DataFrame(_lr_rrr_export_rows).to_excel(
+    os.path.join(OUTPUT_DIR, 'lr_rrr_robustness_stage5.xlsx'), index=False
+)
+print("  Written: lr_rrr_robustness_stage5.xlsx")
+
+# --- Consumer-Discretionary-only: robustness_diagnostics.py computes this (Task 3,
+# function task3_consumer_discretionary_only(), called at line ~1231) but its result
+# is DROPPED from the committed workbook -- every other task (1,2,4,5,6,7,8,9) has a
+# matching entry in the `sheets = {...}` export dict (robustness_diagnostics.py lines
+# ~1245-1263); task3's `results["task3"]` is computed but never added to that dict,
+# so there is no T3_* sheet. This looks like an oversight in the already-committed,
+# locked script, not an intentional exclusion, and robustness_diagnostics.py must not
+# be edited in this stage. Figures below are from a clean re-run of the UNMODIFIED
+# script's console output (2026-07-19): RANDOM_SEED=20260719 is fixed, Task 3 does
+# not consume the RNG, and every OTHER number from that same re-run reproduced the
+# committed workbook exactly cell-for-cell (see canonical_run_manifest.json) -- so
+# this re-run is taken to be a faithful reproduction of what the script would have
+# exported had Task 3 not been dropped. p-values are shown only to the precision the
+# console actually printed ("<.001") rather than fabricated to a false precision.
+_CD_ONLY_FF3_ALPHA, _CD_ONLY_FF3_T, _CD_ONLY_N = 2.4802, 3.359, 88
+_CD_ONLY_FF5_ALPHA, _CD_ONLY_FF5_T = 2.6084, 3.740
+_cd_only_ff3_se = _se_from_t(_CD_ONLY_FF3_ALPHA, _CD_ONLY_FF3_T)
+_cd_only_ff5_se = _se_from_t(_CD_ONLY_FF5_ALPHA, _CD_ONLY_FF5_T)
+
+
+def _rob_row(label, ff3_alpha, ff3_se, ff3_p, ff5_alpha, ff5_se, ff5_p, n):
+    """Build a 2-line (coef row + SE/p row) entry for the consolidated robustness
+    table. ff3_p/ff5_p may be a float p-value or a pre-formatted display string
+    (e.g. '[<.001]') when only a rounded value is available from source."""
+    p3 = ff3_p if isinstance(ff3_p, str) else _fmt_pval(ff3_p)
+    p5 = ff5_p if isinstance(ff5_p, str) else _fmt_pval(ff5_p)
+    n_cell = fmt_int(n) if n is not None else ''
+    line1 = f"{label} & {_fmt_coef(ff3_alpha)} & {_fmt_coef(ff5_alpha)} & {n_cell} \\\\"
+    line2 = f" & ({fmt(ff3_se,4)}) {p3} & ({fmt(ff5_se,4)}) {p5} & \\\\"
+    return [line1, line2]
+
+
+_rob_lines = []
+_rob_lines.append('\\begin{threeparttable}')
+_rob_lines.append('\\footnotesize')
+_rob_lines.append('\\resizebox{\\textwidth}{!}{%')
+_rob_lines.append('\\begin{tabular}{lrrr}')
+_rob_lines.append('\\toprule')
+_rob_lines.append('Specification & FF3 $\\alpha$ (\\%/mo) & FF5 $\\alpha$ (\\%/mo) & $N$ \\\\')
+_rob_lines.append('\\midrule')
+
+_b3, _b5 = _reg_rrr_adj['Q1-Q4_FF3'], _reg_rrr_adj['Q1-Q4_FF5']
+_rob_lines += _rob_row('Baseline (main specification)',
+                        _b3['alpha']*100, _b3['se_alpha']*100, _b3['alpha_p'],
+                        _b5['alpha']*100, _b5['se_alpha']*100, _b5['alpha_p'], _b3['n_obs'])
+
+_boot3 = _t2_boot[(_t2_boot['spec'] == 'FF3') & (_t2_boot['block_length_months'] == 6)].iloc[0]
+_boot5 = _t2_boot[(_t2_boot['spec'] == 'FF5') & (_t2_boot['block_length_months'] == 6)].iloc[0]
+_rob_lines.append(
+    f"Block bootstrap (6-month blocks, $n=5{{,}}000$) & {_fmt_coef(_boot3['boot_mean_pct'])} & "
+    f"{_fmt_coef(_boot5['boot_mean_pct'])} & {fmt_int(_boot3['n_obs'])} \\\\"
+)
+_rob_lines.append(
+    f" & 95\\% CI $[{fmt(_boot3['ci_lo_pct'],4)},\\,{fmt(_boot3['ci_hi_pct'],4)}]$ & "
+    f"95\\% CI $[{fmt(_boot5['ci_lo_pct'],4)},\\,{fmt(_boot5['ci_hi_pct'],4)}]$ & \\\\"
+)
+
+for _period, _label in [('first_half', 'First-half subperiod (2017-09 to 2021-04)'),
+                         ('second_half', 'Second-half subperiod (2021-05 to 2024-12)')]:
+    _s3 = _t2_sub[(_t2_sub['period'] == _period) & (_t2_sub['spec'] == 'FF3')].iloc[0]
+    _s5 = _t2_sub[(_t2_sub['period'] == _period) & (_t2_sub['spec'] == 'FF5')].iloc[0]
+    _rob_lines += _rob_row(_label,
+                            _s3['alpha_pct'], _se_from_t(_s3['alpha_pct'], _s3['t']), _s3['p'],
+                            _s5['alpha_pct'], _se_from_t(_s5['alpha_pct'], _s5['t']), _s5['p'], _s3['n_obs'])
+
+_rob_lines += _rob_row('Consumer Discretionary sector only (re-quartiled within sector)',
+                        _CD_ONLY_FF3_ALPHA, _cd_only_ff3_se, '[<.001]',
+                        _CD_ONLY_FF5_ALPHA, _cd_only_ff5_se, '[<.001]', _CD_ONLY_N)
+
+_e3, _e5 = _reg_ew['Q1-Q4_FF3'], _reg_ew['Q1-Q4_FF5']
+_rob_lines += _rob_row('Equal-weighted (vs.\\ value-weighted baseline)',
+                        _e3['alpha']*100, _e3['se_alpha']*100, _e3['alpha_p'],
+                        _e5['alpha']*100, _e5['se_alpha']*100, _e5['alpha_p'], _e3['n_obs'])
+
+for _bps in [25, 50, 100]:
+    _c3 = _t7_cost[(_t7_cost['Spec'] == 'FF3') & (_t7_cost['Cost_bps'] == _bps)].iloc[0]
+    _c5 = _t7_cost[(_t7_cost['Spec'] == 'FF5') & (_t7_cost['Cost_bps'] == _bps)].iloc[0]
+    _tag = ' (primary)' if _bps == 50 else ''
+    _rob_lines += _rob_row(f'Net of {_bps}bp round-trip trading cost{_tag}',
+                            _c3['Net_alpha_pct'], _se_from_t(_c3['Net_alpha_pct'], _c3['Net_t']), _c3['Net_p'],
+                            _c5['Net_alpha_pct'], _se_from_t(_c5['Net_alpha_pct'], _c5['Net_t']), _c5['Net_p'], None)
+
+_pp3, _pp5 = _reg_placebo['High-Low_FF3'], _reg_placebo['High-Low_FF5']
+_rob_lines += _rob_row('Same-growth placebo (High$-$Low \\RRR{}, top-growth-quartile firms only)',
+                        _pp3['alpha']*100, _pp3['se_alpha']*100, _pp3['alpha_p'],
+                        _pp5['alpha']*100, _pp5['se_alpha']*100, _pp5['alpha_p'], _pp3['n_obs'])
+
+_l3, _l5 = _reg_lr_rrr['Q1-Q4_FF3'], _reg_lr_rrr['Q1-Q4_FF5']
+_rob_lines += _rob_row('4-quarter-trailing \\RRR{} definition (industry-time adjusted)',
+                        _l3['alpha']*100, _l3['se_alpha']*100, _l3['alpha_p'],
+                        _l5['alpha']*100, _l5['se_alpha']*100, _l5['alpha_p'], _l3['n_obs'])
+
+_rob_lines.append('\\bottomrule')
+_rob_lines.append('\\end{tabular}%')
+_rob_lines.append('}')
+_rob_lines.append('\\begin{tablenotes}')
+_rob_lines.append('\\small')
+_rob_lines.append(
+    r'\item \textit{Notes:} Value-weighted, industry-time-adjusted \RRR{} quartile long-short '
+    r'portfolio (Q1$-$Q4) under a battery of robustness variants; the baseline row reproduces the main '
+    r'specification for reference. Each row after the label shows the coefficient on top and, on the '
+    r'row below, the standard error in parentheses followed by the exact $p$-value in brackets (no '
+    r'significance stars), except the bootstrap row, which reports a percentile 95\% confidence '
+    r'interval in place of a parametric SE/$p$-value (the point estimate shown is the bootstrap mean; '
+    r'results are qualitatively identical using 3- or 12-month blocks in place of the 6-month primary '
+    r'block; source: robustness\_diagnostics.py Task 2). Consumer-Discretionary-only re-quartiles '
+    r'\RRR{} within that sector'"'"'s cross-section each quarter (90 of 124 firms; 82.1 avg firms/quarter '
+    r'in the resulting sort) rather than merely filtering the all-sector quartile assignment; source: '
+    r'robustness\_diagnostics.py Task 3 console output, not persisted to that script'"'"'s committed '
+    r'workbook (see canonical\_run\_manifest.json) -- $p$-values shown to the precision available '
+    r'(\textless.001). Equal-weighted source: this script'"'"'s own inline reconstruction, matching '
+    r'analysis\_v2.py phase4\_additional\_tests() section 4.3 exactly. Trading-cost assumption follows '
+    r'Novy-Marx and Velikov (2016, \textit{Review of Financial Studies} 29(1):104--147); 50bp round-trip '
+    r'is the primary assumption for "large, liquid stocks," 25bp/100bp are sensitivity bounds; net '
+    r'alpha nets a cost drag against the gross (baseline) alpha using the strategy'"'"'s realized '
+    r'quarterly turnover (source: robustness\_diagnostics.py Task 7). Same-growth placebo restricts to '
+    r'the top revenue-growth quartile each quarter and splits by \RRR{} at the median within that '
+    r'subsample; reported as a single row per author decision (demoted from a standalone table). '
+    r'4-quarter-trailing \RRR{} redefines the retention signal against the revenue base four quarters '
+    r'(one year) prior rather than the prior quarter, industry-time adjusted the same way as the main '
+    r'signal; all other construction (timing, weighting) is unchanged (source: this script, '
+    r'lr\_rrr\_robustness\_stage5.xlsx, ported forward from the LR\_RRR column already computed in the '
+    r'canonical panel).'
+)
+_rob_lines.append('\\end{tablenotes}')
+_rob_lines.append('\\end{threeparttable}')
+_write_tabular(_rob_lines, os.path.join(TABLE_DIR, 'tab_robustness_consolidated.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 4): Concentration — effective-N/HHI, exclude-top-K, Amazon exclusion
+# ============================================================================
+print("[Table] Concentration diagnostics (effective-N/HHI, exclude-top-k, Amazon exclusion)...")
+
+_t1_effn_q1 = pd.read_excel(DIAG_XLSX, sheet_name='T1_EffN_Q1')
+_t1_effn_q4 = pd.read_excel(DIAG_XLSX, sheet_name='T1_EffN_Q4')
+_t1_excl = pd.read_excel(DIAG_XLSX, sheet_name='T1_ExcludeTopK')
+_amzn = pd.read_excel(os.path.join(OUTPUT_DIR, 'exclude_amazon_robustness.xlsx'), sheet_name='Summary_Comparison')
+
+_tab_conc_lines = []
+_tab_conc_lines.append('\\begin{threeparttable}')
+_tab_conc_lines.append('\\footnotesize')
+_tab_conc_lines.append('\\begin{tabular}{lrrrr}')
+_tab_conc_lines.append('\\toprule')
+_tab_conc_lines.append(
+    '\\multicolumn{5}{l}{\\textbf{Panel A: Effective-$N$ / Herfindahl Concentration by Quarter (long and short legs)}} \\\\'
+)
+_tab_conc_lines.append('\\midrule')
+_tab_conc_lines.append(' & Mean & Median & Min & Max \\\\')
+for _label, _series in [
+    ('Q1 (long leg) HHI', _t1_effn_q1['HHI']),
+    ('Q1 (long leg) Effective $N$', _t1_effn_q1['EFFECTIVE_N']),
+    ('Q4 (short leg) HHI', _t1_effn_q4['HHI']),
+    ('Q4 (short leg) Effective $N$', _t1_effn_q4['EFFECTIVE_N']),
+]:
+    _tab_conc_lines.append(
+        f"{_label} & {fmt(_series.mean(),4)} & {fmt(_series.median(),4)} & "
+        f"{fmt(_series.min(),4)} & {fmt(_series.max(),4)} \\\\"
+    )
+_tab_conc_lines.append('\\midrule')
+_tab_conc_lines.append(
+    '\\multicolumn{5}{l}{\\textbf{Panel B: Long-Short Alpha Excluding the Top-$K$ Formation-Cap Names from Q1}} \\\\'
+)
+_tab_conc_lines.append('\\midrule')
+_tab_conc_lines.append(' & FF3 $\\alpha$ (\\%/mo) & FF5 $\\alpha$ (\\%/mo) & Avg.\\ \\% of Q1 excl.\\ & \\\\')
+for _, _r in _t1_excl.iterrows():
+    _tab_conc_lines.append(
+        f"{_r['Specification']} & {_fmt_coef(_r['FF3_alpha_pct'])} & {_fmt_coef(_r['FF5_alpha_pct'])} & "
+        f"{fmt(_r['avg_pct_weight_excluded'],2)}\\% & \\\\"
+    )
+    _tab_conc_lines.append(
+        f" & ({fmt(_se_from_t(_r['FF3_alpha_pct'], _r['FF3_t']),4)}) {_fmt_pval(_r['FF3_p'])} & "
+        f"({fmt(_se_from_t(_r['FF5_alpha_pct'], _r['FF5_t']),4)}) {_fmt_pval(_r['FF5_p'])} & & \\\\"
+    )
+_tab_conc_lines.append('\\midrule')
+_tab_conc_lines.append(
+    '\\multicolumn{5}{l}{\\textbf{Panel C: Amazon-Specific Full-Period Exclusion (separate from Panel B)}} \\\\'
+)
+_tab_conc_lines.append('\\midrule')
+for _idx in [0, 1]:
+    _a = _amzn.iloc[_idx]
+    _tab_conc_lines.append(
+        f"{_a['Specification']} & {_fmt_coef(_a['FF3_alpha_pct'])} & {_fmt_coef(_a['FF5_alpha_pct'])} & & \\\\"
+    )
+    _tab_conc_lines.append(
+        f" & ({fmt(_se_from_t(_a['FF3_alpha_pct'], _a['FF3_t']),4)}) {_fmt_pval(_a['FF3_p'])} & "
+        f"({fmt(_se_from_t(_a['FF5_alpha_pct'], _a['FF5_t']),4)}) {_fmt_pval(_a['FF5_p'])} & & \\\\"
+    )
+_tab_conc_lines.append('\\bottomrule')
+_tab_conc_lines.append('\\end{tabular}')
+_tab_conc_lines.append('\\begin{tablenotes}')
+_tab_conc_lines.append('\\small')
+_tab_conc_lines.append(
+    r'\item \textit{Notes:} Source: robustness\_diagnostics.py (Panels A, B) and '
+    r'exclude\_amazon\_robustness.py (Panel C). Panel A summarizes, across the 30 sample quarters, the '
+    r'Herfindahl index (HHI, sum of squared formation-cap weights) and effective $N$ ($1/\text{HHI}$) '
+    r'of the Q1 (long) and Q4 (short) legs. Panel B drops the top-$K$ formation-cap names from the long '
+    r'leg each quarter and re-forms the long-short alpha; standard error in parentheses, exact '
+    r'$p$-value in brackets, no significance stars. Panel C is a separate, full-period robustness check '
+    r'that removes AMZN US EQUITY from the investable universe entirely before any sorting (not merely '
+    r'excluded when it lands in Q1); it is not a per-quarter top-$K$ exclusion and should not be read as '
+    r'directly comparable to Panel B. The FF3 alpha and its $t$-statistic move modestly ($t$: 2.94 '
+    r'$\to$ 2.80), but the FF5 alpha and its $t$-statistic move more ($t$: 3.29 $\to$ 2.59) -- a '
+    r'meaningfully closer call than the baseline, not a robustly unchanged result.'
+)
+_tab_conc_lines.append('\\end{tablenotes}')
+_tab_conc_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_conc_lines, os.path.join(TABLE_DIR, 'tab_concentration.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 5): Full-Quartile Monotonicity
+# ============================================================================
+print("[Table] Full-quartile monotonicity...")
+
+_t5_mono = pd.read_excel(DIAG_XLSX, sheet_name='T5_QuartileAlphas')
+_t5_mono = _t5_mono[_t5_mono['Portfolio'] != 'MONOTONIC_Q1_TO_Q4']
+
+_tab_mono_lines = []
+_tab_mono_lines.append('\\begin{threeparttable}')
+_tab_mono_lines.append('\\footnotesize')
+_tab_mono_lines.append('\\begin{tabular}{lrr}')
+_tab_mono_lines.append('\\toprule')
+_tab_mono_lines.append(' & FF3 $\\alpha$ (\\%/mo) & FF5 $\\alpha$ (\\%/mo) \\\\')
+_tab_mono_lines.append('\\midrule')
+for _q in ['Q1', 'Q2', 'Q3', 'Q4']:
+    _r3 = _t5_mono[(_t5_mono['Spec'] == 'FF3') & (_t5_mono['Portfolio'] == _q)].iloc[0]
+    _r5 = _t5_mono[(_t5_mono['Spec'] == 'FF5') & (_t5_mono['Portfolio'] == _q)].iloc[0]
+    _tab_mono_lines.append(f"{_q} & {_fmt_coef(_r3['Alpha_pct'])} & {_fmt_coef(_r5['Alpha_pct'])} \\\\")
+    _se3 = _se_from_t(_r3['Alpha_pct'], _r3['t'])
+    _se5 = _se_from_t(_r5['Alpha_pct'], _r5['t'])
+    _tab_mono_lines.append(f" & ({fmt(_se3,4)}) {_fmt_pval(_r3['p'])} & ({fmt(_se5,4)}) {_fmt_pval(_r5['p'])} \\\\")
+_tab_mono_lines.append('\\bottomrule')
+_tab_mono_lines.append('\\end{tabular}')
+_tab_mono_lines.append('\\begin{tablenotes}')
+_tab_mono_lines.append('\\small')
+_tab_mono_lines.append(
+    r'\item \textit{Notes:} Source: robustness\_diagnostics.py Task 5. Individual-quartile factor-model '
+    r'alphas for the value-weighted, industry-time-adjusted \RRR{} sort; the long-short row (Q1$-$Q4) '
+    r'is reported separately in the paper'"'"'s main adjusted-\RRR{} long-short alpha table and not '
+    r'repeated here. Standard error in parentheses, exact $p$-value in brackets, no significance stars. '
+    r'Point estimates decline monotonically from Q1 to Q4 under both FF3 and FF5; statistical '
+    r'significance concentrates in Q4 (and, under FF5, marginally in Q1), with Q2 and Q3 individually '
+    r'indistinguishable from zero.'
+)
+_tab_mono_lines.append('\\end{tablenotes}')
+_tab_mono_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_mono_lines, os.path.join(TABLE_DIR, 'tab_quartile_monotonicity.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 7): H2a / H2b Asymmetry
+# ============================================================================
+print("[Table] H2a/H2b asymmetry (downside-risk bootstrap + up/down-market interaction)...")
+
+_t8a = pd.read_excel(DIAG_XLSX, sheet_name='T8_H2a_Bootstrap')
+_t8b_cont = pd.read_excel(DIAG_XLSX, sheet_name='T8_H2b_Continuous')
+_t8b_dummy = pd.read_excel(DIAG_XLSX, sheet_name='T8_H2b_Dummy')
+
+_H2A_LABELS = {
+    'downside_beta (Q1-Q4)': 'Downside $\\beta$ (Q1$-$Q4)',
+    'ann_vol (Q1-Q4)': 'Annualized volatility (Q1$-$Q4)',
+    'ann_sharpe (Q1-Q4)': 'Annualized Sharpe (Q1$-$Q4)',
+}
+_tab_h2_lines = []
+_tab_h2_lines.append('\\begin{threeparttable}')
+_tab_h2_lines.append('\\footnotesize')
+_tab_h2_lines.append('\\textbf{Panel A: H2a, Bootstrap Q1 vs.\\ Q4 Differences (downside/insurance)}')
+_tab_h2_lines.append('')
+_tab_h2_lines.append('\\begin{tabular}{lrrrl}')
+_tab_h2_lines.append('\\toprule')
+_tab_h2_lines.append('Metric & Point est.\\ & Boot.\\ SE & 95\\% CI & Distinguishable from 0 \\\\')
+_tab_h2_lines.append('\\midrule')
+for _, _r in _t8a.iterrows():
+    _label = _H2A_LABELS.get(_r['Metric'], _r['Metric'])
+    _sig = 'Yes' if _r['Distinguishable_from_zero_95pct'] else 'No'
+    _tab_h2_lines.append(
+        f"{_label} & {_fmt_coef(_r['Point_estimate'])} & {fmt(_r['Boot_SE'],4)} & "
+        f"$[{fmt(_r['CI_lo'],4)},\\,{fmt(_r['CI_hi'],4)}]$ & {_sig} \\\\"
+    )
+_tab_h2_lines.append('\\bottomrule')
+_tab_h2_lines.append('\\end{tabular}')
+_tab_h2_lines.append('')
+_tab_h2_lines.append('\\vspace{6pt}')
+_tab_h2_lines.append('')
+_tab_h2_lines.append('\\textbf{Panel B: H2b, Up-Market / Down-Market Signal Sensitivity (panel regression)}')
+_tab_h2_lines.append('')
+_tab_h2_lines.append('\\begin{tabular}{lrr}')
+_tab_h2_lines.append('\\toprule')
+_tab_h2_lines.append(' & (1) Continuous \\RRR{} & (2) Q1-vs-Q4 dummy \\\\')
+_tab_h2_lines.append('\\midrule')
+_H2B_ROLE_MAP = [
+    ('const', 'const', 'Constant'),
+    ('MKT_RF', 'MKT_RF', 'Market excess return'),
+    ('ADJ_RRR_PCT', 'Q1_DUMMY', 'Signal (Adj.\\ RRR\\ /\\ Q1 dummy)'),
+    ('UP', 'UP', 'Up-market dummy'),
+    ('ADJ_RRR_PCT_x_MKT', 'Q1_DUMMY_x_MKT', 'Signal $\\times$ Market'),
+    ('ADJ_RRR_PCT_x_MKT_x_UP', 'Q1_DUMMY_x_MKT_x_UP', 'Signal $\\times$ Market $\\times$ Up (focal)'),
+]
+for _cont_var, _dummy_var, _disp in _H2B_ROLE_MAP:
+    _rc = _t8b_cont[_t8b_cont['Variable'] == _cont_var]
+    _rd = _t8b_dummy[_t8b_dummy['Variable'] == _dummy_var]
+    _cc = _fmt_coef(_rc.iloc[0]['Coef']) if len(_rc) else ''
+    _dc = _fmt_coef(_rd.iloc[0]['Coef']) if len(_rd) else ''
+    _tab_h2_lines.append(f"{_disp} & {_cc} & {_dc} \\\\")
+    _cse = f"({fmt(_rc.iloc[0]['SE'],4)}) {_fmt_pval(_rc.iloc[0]['p'])}" if len(_rc) else ''
+    _dse = f"({fmt(_rd.iloc[0]['SE'],4)}) {_fmt_pval(_rd.iloc[0]['p'])}" if len(_rd) else ''
+    _tab_h2_lines.append(f" & {_cse} & {_dse} \\\\")
+_tab_h2_lines.append('\\bottomrule')
+_tab_h2_lines.append('\\end{tabular}')
+_tab_h2_lines.append('\\begin{tablenotes}')
+_tab_h2_lines.append('\\small')
+_tab_h2_lines.append(
+    r'\item \textit{Notes:} Source: robustness\_diagnostics.py Task 8. Panel A: block-bootstrap ($n=5{,}000$) '
+    r'Q1-minus-Q4 differences in downside beta, annualized volatility and annualized Sharpe ratio; '
+    r'reported honestly including the non-significant downside-beta difference (95\% CI includes 0). '
+    r'Panel B: panel regressions of monthly excess return on market excess return, an \RRR{} signal '
+    r'(continuous industry-time-adjusted \RRR{}, or a Q1-vs-Q4 dummy), an up-market dummy (UP), and '
+    r'their interactions; two-way (firm, month) clustered standard errors '
+    r'(Cameron-Gelbach-Miller 2011). The focal H2b term is the triple interaction '
+    r'(Signal $\times$ Market $\times$ Up); it is small and statistically indistinguishable from zero '
+    r'in both specifications, reported here in full rather than omitted. Standard errors in '
+    r'parentheses, exact $p$-values in brackets, no significance stars.'
+)
+_tab_h2_lines.append('\\end{tablenotes}')
+_tab_h2_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_h2_lines, os.path.join(TABLE_DIR, 'tab_h2ab_asymmetry.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 8): Sloan-Style Persistence — both legs, honest mixed result
+# ============================================================================
+print("[Table] Sloan-style persistence of revenue components (both legs)...")
+
+_sloan = pd.read_excel(IDBAT_XLSX, sheet_name='T4_sloan_persistence')
+_SLOAN_DV_LABELS = {
+    'RG_LEAD': 'Future revenue growth $RG_{t+1}$ (\\%)',
+    'OPINC_ROA_LEAD': 'Future operating ROA $OpInc_{t+1}/Assets_t$ (\\%)',
+}
+
+_tab_sloan_lines = []
+_tab_sloan_lines.append('\\begin{threeparttable}')
+_tab_sloan_lines.append('\\footnotesize')
+_tab_sloan_lines.append('\\resizebox{\\textwidth}{!}{%')
+_tab_sloan_lines.append('\\begin{tabular}{llrrrl}')
+_tab_sloan_lines.append('\\toprule')
+_tab_sloan_lines.append(
+    'Dependent variable & Sample & Retention $b$ & Acquisition $b$ & Diff.\\ (firm-cl.\\ $t$) & Criterion \\\\'
+)
+_tab_sloan_lines.append('\\midrule')
+for _dv in ['RG_LEAD', 'OPINC_ROA_LEAD']:
+    _tab_sloan_lines.append(f"\\multicolumn{{6}}{{l}}{{\\textbf{{{_SLOAN_DV_LABELS[_dv]}}}}} \\\\")
+    _sub = _sloan[_sloan['DV'] == _dv]
+    for _, _r in _sub.iterrows():
+        _tab_sloan_lines.append(
+            f"\\quad & {_r['Winsor']} & {_fmt_coef(_r['b_retention'])} & {_fmt_coef(_r['b_acquisition'])} & "
+            f"{_fmt_coef(_r['diff_ret_minus_acq_firmcl'])} (${fmt(_r['diff_t_firmcl'],2)}$) & {_r['criterion']} \\\\"
+        )
+        _se_ret = _se_from_t(_r['b_retention'], _r['t_retention'])
+        _se_acq = _se_from_t(_r['b_acquisition'], _r['t_acquisition'])
+        _tab_sloan_lines.append(
+            f"\\quad & & ({fmt(_se_ret,4)}) & ({fmt(_se_acq,4)}) & "
+            f"two-way $t={fmt(_r['diff_t_twoway'],2)}$ & \\\\"
+        )
+        _tab_sloan_lines.append(
+            f"\\quad & & {_fmt_pval(_r['p_retention'])} & {_fmt_pval(_r['p_acquisition'])} & "
+            f"{_fmt_pval(_r['diff_p_firmcl'])} & \\\\"
+        )
+    _tab_sloan_lines.append('\\midrule')
+_tab_sloan_lines[-1] = '\\bottomrule'  # replace the trailing extra midrule
+_tab_sloan_lines.append('\\end{tabular}%')
+_tab_sloan_lines.append('}')
+_tab_sloan_lines.append('\\begin{tablenotes}')
+_tab_sloan_lines.append('\\small')
+_tab_sloan_lines.append(
+    r'\item \textit{Notes:} Source: identification\_battery.py Task 4. Pooled OLS of the future outcome '
+    r'on current-quarter retention and acquisition revenue-composition intensities (both scaled by '
+    r'lagged total revenue, so the retention intensity equals contemporaneous \RRR{}) plus quarter '
+    r'fixed effects; firm-clustered standard errors. Diff.\ column reports the firm-clustered test of '
+    r'(Retention $-$ Acquisition) with its $t$-statistic; the two-way (firm $\times$ quarter) clustered '
+    r'$t$-statistic is shown on the row below for comparison. Exact $p$-values (firm-clustered) in '
+    r'brackets on the third row; no significance stars. Pre-registered criterion: PASS requires '
+    r'retention $b >$ acquisition $b$ and a significant firm-clustered diff. A Fama-MacBeth '
+    r'(cross-sectional-by-quarter) version of the diff.\ test, $T=30$ quarters, gives diff.\ '
+    r'$=1.7845$ ($t=5.92$, $p<.001$) for the operating-ROA, winsorized row -- printed to console by '
+    r'identification\_battery.py (Task 4) but not persisted to its committed workbook; re-verified by a '
+    r'clean re-run of the unmodified script (see canonical\_run\_manifest.json). '
+    r'The two dependent variables give an honestly mixed result: the operating-ROA leg passes the '
+    r'pre-registered criterion in both raw and winsorized form (retained revenue predicts future '
+    r'profitability more than acquired revenue does), while the revenue-growth leg is wrong-signed '
+    r'once winsorized (acquisition $b$ exceeds retention $b$) -- this is presented plainly as a mixed '
+    r'result, not a clean pass.'
+)
+_tab_sloan_lines.append('\\end{tablenotes}')
+_tab_sloan_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_sloan_lines, os.path.join(TABLE_DIR, 'tab_sloan_persistence.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 9): Future-Beta Retry — minor, heavily caveated supporting note
+# ============================================================================
+print("[Table] Future-beta retry (rank-based, outlier-robust; minor/caveated)...")
+
+_fb = pd.read_excel(os.path.join(OUTPUT_DIR, 'future_beta_retry.xlsx'), sheet_name='robust_rank_winsor_FM')
+_fb_outlier = pd.read_excel(os.path.join(OUTPUT_DIR, 'future_beta_retry.xlsx'), sheet_name='outlier_diagnosis')
+_fb_headline = _fb[_fb['Spec'] == 'rank(0-1) panel [headline]']
+_fb_vw_adj = _fb_headline[(_fb_headline['Beta_def'] == 'sample VW market') &
+                          (_fb_headline['Signal'] == 'ADJ_RRR_PCT')].iloc[0]
+_fb_outlier_share = _fb_outlier.iloc[0]['top_Sxx_share'] * 100
+
+_tab_fb_lines = []
+_tab_fb_lines.append('\\begin{threeparttable}')
+_tab_fb_lines.append('\\footnotesize')
+_tab_fb_lines.append('\\begin{tabular}{llrrr}')
+_tab_fb_lines.append('\\toprule')
+_tab_fb_lines.append('Beta definition & Signal & Coef.\\ & $t$ & $N$ \\\\')
+_tab_fb_lines.append('\\midrule')
+for _, _r in _fb_headline.iterrows():
+    _tab_fb_lines.append(
+        f"{_r['Beta_def']} & {_r['Signal']} & {_fmt_coef(_r['coef'])} & ${fmt(_r['t'],2)}$ & {fmt_int(_r['N'])} \\\\"
+    )
+    _fb_se = _se_from_t(_r['coef'], _r['t'])
+    _tab_fb_lines.append(f" & & ({fmt(_fb_se,4)}) {_fmt_pval(_r['p'])} & & \\\\")
+_tab_fb_lines.append('\\bottomrule')
+_tab_fb_lines.append('\\end{tabular}')
+_tab_fb_lines.append('\\begin{tablenotes}')
+_tab_fb_lines.append('\\small')
+_tab_fb_lines.append(
+    r'\item \textit{Notes:} Source: future\_beta\_retry.py, sheet robust\_rank\_winsor\_FM. '
+    r'Rank(0--1)-transformed panel regression of a firm'"'"'s own trailing (12-month, $\geq$8 valid '
+    r'months) market beta on the rank-transformed \RRR{} signal; two-way (firm, quarter) clustered '
+    r'standard errors. This is a minor, heavily caveated supporting result, presented here as a note '
+    r'rather than a headline finding; its placement in the main text versus an appendix is left to '
+    r'author judgment at the prose-writing stage. '
+    r'\textbf{Caveat 1 (outlier dependence):} an outlier-robust (rank-based) specification is required '
+    rf'-- one quarter, 2020Q3, accounts for {_fb_outlier_share:.1f}\% of the weight in the '
+    r'$S_{xx}$-weighted slope for adjusted \RRR{} and otherwise dominates the untransformed '
+    r'level-panel version of this same regression (coef.\ $\approx 0.00003$, $t\approx 0.11$, not '
+    r'significant; not tabulated). '
+    r'\textbf{Caveat 2 (benchmark dependence):} this result does not extend to the sample'"'"'s own '
+    r'value-weighted market beta -- substituting "sample VW market" for "FF market" as the dependent '
+    rf'variable weakens the ADJ\_RRR\_PCT coefficient to ${_fb_vw_adj["coef"]:.4f}$ '
+    rf'($t={_fb_vw_adj["t"]:.2f}$, not significant at conventional levels).'
+)
+_tab_fb_lines.append('\\end{tablenotes}')
+_tab_fb_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_fb_lines, os.path.join(TABLE_DIR, 'tab_future_beta_retry.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 10): SoRR — alpha, turnover/stability comparison, correlation
+# ============================================================================
+print("[Table] SoRR (Share of Retained Revenue): alpha, turnover-stability, correlation with RRR...")
+
+_sorr_xlsx = os.path.join(OUTPUT_DIR, 'performance_sorr_summary.xlsx')
+_sorr_alpha = pd.read_excel(_sorr_xlsx, sheet_name='SoRR_LongShort_Alpha')
+_sorr_turnover = pd.read_excel(_sorr_xlsx, sheet_name='Signal_Turnover_Comparison').set_index('signal')
+_sorr_corr = pd.read_excel(_sorr_xlsx, sheet_name='RRR_SoRR_Correlation').iloc[0]
+
+_tab_sorr_lines = []
+_tab_sorr_lines.append('\\begin{threeparttable}')
+_tab_sorr_lines.append('\\footnotesize')
+_tab_sorr_lines.append('\\begin{tabular}{lrrr}')
+_tab_sorr_lines.append('\\toprule')
+_tab_sorr_lines.append('\\multicolumn{4}{l}{\\textbf{Panel A: SoRR Long-Short Alpha (Q1$-$Q4, adjusted signal)}} \\\\')
+_tab_sorr_lines.append('\\midrule')
+_tab_sorr_lines.append('Model & $\\alpha$ (\\%/mo) & $R^2$ & $N$ \\\\')
+for _, _r in _sorr_alpha.iterrows():
+    _tab_sorr_lines.append(
+        f"{_r['Spec']} & {_fmt_coef(_r['alpha_pct_month'])} & {fmt(_r['r2'],4)} & {fmt_int(_r['n_obs'])} \\\\"
+    )
+    _tab_sorr_lines.append(f" & ({fmt(_r['se_pct'],4)}) {_fmt_pval(_r['p_value'])} & & \\\\")
+_tab_sorr_lines.append('\\midrule')
+_tab_sorr_lines.append('\\multicolumn{4}{l}{\\textbf{Panel B: Signal Turnover / Stability Comparison}} \\\\')
+_tab_sorr_lines.append('\\midrule')
+_tab_sorr_lines.append(' & Mean abs.\\ chg.\\ (pp/qtr) & Cross-sect.\\ SD (pp) & Quartile stay-rate \\\\')
+_rrr_turn = _sorr_turnover.loc['ADJ_RRR_PCT']
+_srr_turn = _sorr_turnover.loc['ADJ_SRR_PCT']
+_tab_sorr_lines.append(
+    f"Adj.\\ \\RRR{{}} & {fmt(_rrr_turn['mean_abs_change_pp'],2)} & {fmt(_rrr_turn['cross_sectional_sd_pp'],2)} & "
+    f"{fmt(_rrr_turn['quartile_stay_rate']*100,2)}\\% \\\\"
+)
+_tab_sorr_lines.append(
+    f"Adj.\\ SoRR & {fmt(_srr_turn['mean_abs_change_pp'],2)} & {fmt(_srr_turn['cross_sectional_sd_pp'],2)} & "
+    f"{fmt(_srr_turn['quartile_stay_rate']*100,2)}\\% \\\\"
+)
+_turnover_ratio = _rrr_turn['mean_abs_change_pp'] / _srr_turn['mean_abs_change_pp']
+_tab_sorr_lines.append(f"Ratio (\\RRR{{}} / SoRR) & {fmt(_turnover_ratio,1)}$\\times$ & & \\\\")
+_tab_sorr_lines.append('\\midrule')
+_tab_sorr_lines.append('\\multicolumn{4}{l}{\\textbf{Panel C: \\RRR{}--SoRR Correlation (firm-quarter pooled)}} \\\\')
+_tab_sorr_lines.append('\\midrule')
+_tab_sorr_lines.append(
+    f"Pearson (raw / adjusted) & \\multicolumn{{3}}{{l}}{{{fmt(_sorr_corr['pearson_raw'],4)} / "
+    f"{fmt(_sorr_corr['pearson_adj'],4)}}} \\\\"
+)
+_tab_sorr_lines.append(
+    f"Spearman (raw / adjusted) & \\multicolumn{{3}}{{l}}{{{fmt(_sorr_corr['spearman_raw'],4)} / "
+    f"{fmt(_sorr_corr['spearman_adj'],4)}}} \\\\"
+)
+_tab_sorr_lines.append('\\bottomrule')
+_tab_sorr_lines.append('\\end{tabular}')
+_tab_sorr_lines.append('\\begin{tablenotes}')
+_tab_sorr_lines.append('\\small')
+_tab_sorr_lines.append(
+    r'\item \textit{Notes:} Source: performance\_metrics.py (SoRR sub-analysis). SoRR = Share of '
+    r'Retained Revenue = Returning\_Revenue$_t$ / Total\_Revenue$_t$ (normalized by \emph{current}-'
+    r'period revenue; a composition share), distinct from \RRR{} = Returning\_Revenue$_t$ / '
+    r'Total\_Revenue$_{t-1}$ (normalized by \emph{prior}-period revenue; a retention rate). Panel A: '
+    r'value-weighted adjusted-SoRR long-short portfolio, OLS with Newey-West standard errors '
+    r'(automatic bandwidth, Newey and West 1994); '
+    r'standard error in parentheses, exact $p$-value in brackets, no significance stars; the alpha is '
+    r'small and statistically indistinguishable from zero under every factor model. Panel B: SoRR is '
+    r'roughly an order of magnitude more stable quarter-to-quarter than \RRR{} (smaller mean absolute '
+    r'change, much higher quartile stay-rate). Panel C: \RRR{} and SoRR are positively but only '
+    r'moderately correlated; the rank (Spearman) correlation is noticeably higher than the linear '
+    r'(Pearson) correlation. Taken together, these three panels support reading SoRR as evidence that '
+    r'\RRR{} reflects a stable underlying firm characteristic, not as a stronger return predictor in '
+    r'its own right: SoRR is far more persistent than \RRR{} yet does not itself earn a long-short '
+    r'return premium.'
+)
+_tab_sorr_lines.append('\\end{tablenotes}')
+_tab_sorr_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_sorr_lines, os.path.join(TABLE_DIR, 'tab_sorr.tex'))
+
+
+# ============================================================================
+# TABLE (NEW, item 12): Dividend-Yield Check
+# ============================================================================
+print("[Table] Dividend-yield check (Q1 vs Q4; resolves price-only-returns concern)...")
+
+_div_pooled = pd.read_excel(DIAG_XLSX, sheet_name='T6_DivYield_Pooled').set_index('RRR_Q_ADJ')
+_div_firm = pd.read_excel(DIAG_XLSX, sheet_name='T6_DivYield_FirmLevel').set_index('RRR_Q_ADJ')
+_div_fail = pd.read_excel(DIAG_XLSX, sheet_name='T6_Failures')
+_n_div_covered = 124 - len(_div_fail)
+
+_tab_div_lines = []
+_tab_div_lines.append('\\begin{threeparttable}')
+_tab_div_lines.append('\\footnotesize')
+_tab_div_lines.append('\\begin{tabular}{lrrrr}')
+_tab_div_lines.append('\\toprule')
+_tab_div_lines.append(' & Q1 (\\%) & Q4 (\\%) & Q1 $-$ Q4 (pp) & $N$ (Q1 / Q4) \\\\')
+_tab_div_lines.append('\\midrule')
+_pooled_gap = (_div_pooled.loc['Q1', 'mean'] - _div_pooled.loc['Q4', 'mean']) * 100
+_tab_div_lines.append(_latex_escape_row(
+    f"Pooled (firm-quarter obs.) & {fmt(_div_pooled.loc['Q1','mean']*100,2)} & "
+    f"{fmt(_div_pooled.loc['Q4','mean']*100,2)} & {fmt(_pooled_gap,2)} & "
+    f"{fmt_int(_div_pooled.loc['Q1','count'])} / {fmt_int(_div_pooled.loc['Q4','count'])} \\\\"
+))
+_firm_gap = (_div_firm.loc['Q1', 'mean'] - _div_firm.loc['Q4', 'mean']) * 100
+_tab_div_lines.append(_latex_escape_row(
+    f"Firm-level (own-average first) & {fmt(_div_firm.loc['Q1','mean']*100,2)} & "
+    f"{fmt(_div_firm.loc['Q4','mean']*100,2)} & {fmt(_firm_gap,2)} & "
+    f"{fmt_int(_div_firm.loc['Q1','count'])} / {fmt_int(_div_firm.loc['Q4','count'])} \\\\"
+))
+_tab_div_lines.append('\\bottomrule')
+_tab_div_lines.append('\\end{tabular}')
+_tab_div_lines.append('\\begin{tablenotes}')
+_tab_div_lines.append('\\small')
+_tab_div_lines.append(
+    rf'\item \textit{{Notes:}} Source: robustness\_diagnostics.py Task 6 (trailing dividend yield via '
+    rf'yfinance; {_n_div_covered} of 124 sample firms have usable Yahoo Finance price/dividend history, '
+    rf'{len(_div_fail)} failed to resolve, mostly delisted or unrecognized tickers). Trailing dividend '
+    r'yield by adjusted-\RRR{} quartile, Q1 = highest \RRR{}, Q4 = lowest. The Q1$-$Q4 gap is negligible '
+    r'in both pooled and firm-level form and, if anything, slightly negative (Q1 firms pay marginally '
+    r'lower dividends), which resolves the concern that this paper'"'"'s price-only (non-dividend-'
+    r'adjusted) monthly return convention could mechanically favor high-\RRR{} firms through an omitted '
+    r'dividend channel.'
+)
+_tab_div_lines.append('\\end{tablenotes}')
+_tab_div_lines.append('\\end{threeparttable}')
+_write_tabular(_tab_div_lines, os.path.join(TABLE_DIR, 'tab_dividend_check.tex'))
+
+
+# ============================================================================
+# ITEM 13 (AR construct-validity): one sentence per author decision, NOT a
+# dedicated table. Source data (identification_battery.xlsx, sheet T5_AR_winsor_FM)
+# is already committed and unchanged; no table file is written here on purpose.
+# Sentence for Stage 6 prose: "RRR retains a positive Fama-MacBeth coefficient
+# (t=1.75 univariate) even against a 1st/99th-percentile winsorized version of AR
+# (t=1.14 univariate for winsorized AR alone; RRR remains larger and, with controls,
+# becomes significant at t=2.27 [p=.031] while winsorized AR stays insignistant and
+# sign-flips), so RRR's predictive power is not an artifact of AR's heavier tails."
+# ============================================================================
+
+print("\n  Stage 5 canonical-run tables generated (headline, QMJ/BAB, consolidated "
+      "robustness, concentration, monotonicity, signal persistence, H2a/H2b, Sloan "
+      "persistence, future-beta, SoRR, performance/risk, portfolio characteristics, "
+      "dividend check).")
+print("\n  All tables generated.")
 
 
 # ============================================================================
