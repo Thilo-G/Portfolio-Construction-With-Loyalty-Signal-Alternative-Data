@@ -865,6 +865,8 @@ for _lbl, _span in _fmb_groups:
 _fmb_header = ' & '.join([''] + _fmb_col_labels)
 
 _tab6_lines = []
+_tab6_lines.append('\\begin{threeparttable}')
+_tab6_lines.append('\\footnotesize')
 _tab6_lines.append(f'\\begin{{tabular}}{{{_fmb_col_spec}}}')
 _tab6_lines.append('\\toprule')
 _tab6_lines.append(' & '.join(_fmb_group_row) + ' \\\\')
@@ -916,16 +918,22 @@ _tab6_lines.append('  Avg.\\ N & ' + ' & '.join(_n_avg_cells) + ' \\\\')
 
 _tab6_lines.append('\\bottomrule')
 _tab6_lines.append('\\end{tabular}')
-_tab6_lines.append('\\vspace{2pt}')
+_tab6_lines.append('\\begin{tablenotes}')
+_tab6_lines.append('\\small')
 _tab6_lines.append(
-    r'{\footnotesize\textit{Note: Time-series averages of quarterly cross-sectional regression coefficients '
-    r'(Fama-MacBeth). Dependent variable: average monthly excess return in quarter $t+1$. '
-    r'Columns (1)--(2) use the industry-time-adjusted \RRR{} signal; columns (3)--(4) use the raw \RRR{} signal. '
-    r'Controls (column 2 and 4) are lagged one quarter: Size = log market capitalization, '
-    r'BTM = book-to-market, Profit Margin = operating income / revenue. '
-    r'Standard errors in parentheses (Newey-West, 4 lags); exact $p$-values in brackets. '
-    r'No significance stars are used.}}'
+    r'\item \textit{Notes:} Source: analysis\_v2.py (fama\_macbeth.xlsx), run\_fama\_macbeth(). '
+    r'Time-series averages of quarterly cross-sectional regression coefficients (Fama-MacBeth); '
+    r'dependent variable is each firm'"'"'s compounded excess return over the same 2-month-formation, '
+    r'3-month-hold window as the portfolio sorts (identical timing, not an independent check). '
+    r'Columns (1)--(2) use the industry-time-adjusted \RRR{} signal; columns (3)--(4) use the raw '
+    r'\RRR{} signal. Controls (columns 2 and 4) are contemporaneous: Size = log market '
+    r'capitalization, BTM = book-to-market, Profit Margin = operating income / revenue. '
+    r'Standard errors in parentheses, derived from the reported $t$-statistic '
+    r'(Newey-West automatic bandwidth, Newey and West 1994, applied to the time series of quarterly '
+    r'cross-sectional coefficients); exact $p$-values in brackets. No significance stars are used.'
 )
+_tab6_lines.append('\\end{tablenotes}')
+_tab6_lines.append('\\end{threeparttable}')
 _write_tabular(_tab6_lines, os.path.join(TABLE_DIR, 'tab_fmb.tex'))
 
 
