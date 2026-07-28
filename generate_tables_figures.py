@@ -1414,15 +1414,22 @@ print("  Written: lr_rrr_robustness_stage5.xlsx")
 # ~1245-1263); task3's `results["task3"]` is computed but never added to that dict,
 # so there is no T3_* sheet. This looks like an oversight in the already-committed,
 # locked script, not an intentional exclusion, and robustness_diagnostics.py must not
-# be edited in this stage. Figures below are from a clean re-run of the UNMODIFIED
-# script's console output (2026-07-19): RANDOM_SEED=20260719 is fixed, Task 3 does
-# not consume the RNG, and every OTHER number from that same re-run reproduced the
-# committed workbook exactly cell-for-cell (see canonical_run_manifest.json) -- so
-# this re-run is taken to be a faithful reproduction of what the script would have
-# exported had Task 3 not been dropped. p-values are shown only to the precision the
-# console actually printed ("<.001") rather than fabricated to a false precision.
-_CD_ONLY_FF3_ALPHA, _CD_ONLY_FF3_T, _CD_ONLY_N = 2.4802, 3.359, 88
-_CD_ONLY_FF5_ALPHA, _CD_ONLY_FF5_T = 2.6084, 3.740
+# be edited in this stage. fix_cd_only_export.py re-runs Task 3's exact sort and
+# factor-regression logic (imports load_base_data + task3_consumer_discretionary_only
+# read-only; does not reimplement anything) and persists the result to
+# output/cd_only_alpha.xlsx (sheet CD_only_alpha), with a guardrail assert that the
+# persisted FF3/FF5 alpha and t-stat match the originally observed console figures.
+# Read that workbook here rather than hand-typing the figures.
+_cd_only_alpha = pd.read_excel(os.path.join(OUTPUT_DIR, 'cd_only_alpha.xlsx'), sheet_name='CD_only_alpha')
+_cd_only_ff3_row = _cd_only_alpha[_cd_only_alpha['Model'] == 'FF3'].iloc[0]
+_cd_only_ff5_row = _cd_only_alpha[_cd_only_alpha['Model'] == 'FF5'].iloc[0]
+_CD_ONLY_FF3_ALPHA = _cd_only_ff3_row['Alpha_pct_per_month']
+_CD_ONLY_FF3_T = _cd_only_ff3_row['t_stat']
+_CD_ONLY_FF3_P = _cd_only_ff3_row['p_value']
+_CD_ONLY_N = int(_cd_only_ff3_row['N_months'])
+_CD_ONLY_FF5_ALPHA = _cd_only_ff5_row['Alpha_pct_per_month']
+_CD_ONLY_FF5_T = _cd_only_ff5_row['t_stat']
+_CD_ONLY_FF5_P = _cd_only_ff5_row['p_value']
 _cd_only_ff3_se = _se_from_t(_CD_ONLY_FF3_ALPHA, _CD_ONLY_FF3_T)
 _cd_only_ff5_se = _se_from_t(_CD_ONLY_FF5_ALPHA, _CD_ONLY_FF5_T)
 
@@ -1473,13 +1480,34 @@ for _period, _label in [('first_half', 'First-half subperiod (2017-09 to 2021-04
                             _s5['alpha_pct'], _se_from_t(_s5['alpha_pct'], _s5['t']), _s5['p'], _s3['n_obs'])
 
 _rob_lines += _rob_row('Consumer Discretionary sector only (re-quartiled within sector)',
-                        _CD_ONLY_FF3_ALPHA, _cd_only_ff3_se, '[<.001]',
-                        _CD_ONLY_FF5_ALPHA, _cd_only_ff5_se, '[<.001]', _CD_ONLY_N)
+                        _CD_ONLY_FF3_ALPHA, _cd_only_ff3_se, _CD_ONLY_FF3_P,
+                        _CD_ONLY_FF5_ALPHA, _cd_only_ff5_se, _CD_ONLY_FF5_P, _CD_ONLY_N)
+
+# --- Excluding COVID-19 period: this row (and the 5-month-formation-lag row below)
+# existed in the committed tab_robustness_consolidated.tex (added by hand, Paper_LaTeX
+# commit "Add missing COVID-exclusion and 5-month-lag rows...") with NO corresponding
+# code in this script -- the same class of gap as the firm+quarter-FE Sloan row fixed
+# above, discovered while verifying that fix. The underlying regression already exists
+# in this script (_reg_nc, computed above for tab_robustness_nocovid.tex, Table 8);
+# reuse it here instead of hand-typing the figures a second time.
+_nc3, _nc5 = _reg_nc['Q1-Q4_FF3'], _reg_nc['Q1-Q4_FF5']
+_rob_lines += _rob_row('Excluding COVID-19 period (2020Q1--2021Q2)',
+                        _nc3['alpha']*100, _nc3['se_alpha']*100, _nc3['alpha_p'],
+                        _nc5['alpha']*100, _nc5['se_alpha']*100, _nc5['alpha_p'], _nc3['n_obs'])
 
 _e3, _e5 = _reg_ew['Q1-Q4_FF3'], _reg_ew['Q1-Q4_FF5']
 _rob_lines += _rob_row('Equal-weighted (vs.\\ value-weighted baseline)',
                         _e3['alpha']*100, _e3['se_alpha']*100, _e3['alpha_p'],
                         _e5['alpha']*100, _e5['se_alpha']*100, _e5['alpha_p'], _e3['n_obs'])
+
+# --- 5-month formation lag: same gap as the COVID-exclusion row above (hand-added to
+# the committed .tex, no code path in this script). _reg_lag2 (factor_reg_Lag2_adj.xlsx,
+# already loaded above for tab_robustness_lag2.tex) is reused here rather than
+# hand-typing the figures a second time.
+_lg3, _lg5 = _reg_lag2['Q1-Q4_FF3'], _reg_lag2['Q1-Q4_FF5']
+_rob_lines += _rob_row('5-month formation lag (vs.\\ 2-month baseline)',
+                        _lg3['alpha']*100, _lg3['se_alpha']*100, _lg3['alpha_p'],
+                        _lg5['alpha']*100, _lg5['se_alpha']*100, _lg5['alpha_p'], _lg3['n_obs'])
 
 for _bps in [25, 50, 100]:
     _c3 = _t7_cost[(_t7_cost['Spec'] == 'FF3') & (_t7_cost['Cost_bps'] == _bps)].iloc[0]
@@ -1515,10 +1543,20 @@ _rob_lines.append(
     r'block; source: robustness\_diagnostics.py Task 2). Consumer-Discretionary-only re-quartiles '
     r'\RRR{} within that sector'"'"'s cross-section each quarter (90 of 124 firms; 82.1 avg firms/quarter '
     r'in the resulting sort) rather than merely filtering the all-sector quartile assignment; source: '
-    r'robustness\_diagnostics.py Task 3 console output, not persisted to that script'"'"'s committed '
-    r'workbook (see canonical\_run\_manifest.json) -- $p$-values shown to the precision available '
-    r'(\textless.001). Equal-weighted source: this script'"'"'s own inline reconstruction, matching '
-    r'analysis\_v2.py phase4\_additional\_tests() section 4.3 exactly. Trading-cost assumption follows '
+    r'fix\_cd\_only\_export.py, output/cd\_only\_alpha.xlsx (re-runs robustness\_diagnostics.py Task 3'"'"'s '
+    r'exact sort and factor-regression logic via a read-only import; that task computes this result but '
+    r'never writes it to robustness\_diagnostics.py'"'"'s own committed workbook, so this companion '
+    r'script persists it separately, with a guardrail assert against the originally observed figures; '
+    r'see canonical\_run\_manifest.json). Excluding COVID-19 period drops 2020Q1--2021Q2 from portfolio '
+    r'formation and factor regressions entirely (not merely a dummy control), reducing $N$ from 88 to 70 '
+    r'months (source: this script'"'"'s _reg_nc, the same regression underlying '
+    r'tab\_robustness\_nocovid.tex). Equal-weighted source: this script'"'"'s own inline reconstruction, matching '
+    r'analysis\_v2.py phase4\_additional\_tests() section 4.3 exactly. 5-month formation lag pushes '
+    r'portfolio formation to five months after the signal quarter-end (one additional quarter beyond the '
+    r'2-month baseline), holding all other construction fixed; $N$ falls to 85 months because the extra '
+    r'quarter'"'"'s lag shortens the usable return series at both ends of the sample (source: this script'"'"'s '
+    r'_reg_lag2, the same regression underlying tab\_robustness\_lag2.tex, factor\_reg\_Lag2\_adj.xlsx). '
+    r'Trading-cost assumption follows '
     r'Novy-Marx and Velikov (2016, \textit{Review of Financial Studies} 29(1):104--147); 50bp round-trip '
     r'is the primary assumption for "large, liquid stocks," 25bp/100bp are sensitivity bounds; net '
     r'alpha nets a cost drag against the gross (baseline) alpha using the strategy'"'"'s realized '
@@ -1742,10 +1780,63 @@ _write_tabular(_tab_h2_lines, os.path.join(TABLE_DIR, 'tab_h2ab_asymmetry.tex'))
 print("[Table] Sloan-style persistence of revenue components (both legs)...")
 
 _sloan = pd.read_excel(IDBAT_XLSX, sheet_name='T4_sloan_persistence')
+
+# Fama-MacBeth confirmation of the diff test (identification_battery.py Task 4
+# computes this via _persistence_regression's `fm` dict and prints it to console,
+# but never appends it to the exported T4_sloan_persistence sheet).
+# fix_fm_persistence_export.py re-runs the exact FM computation read-only and
+# persists it to output/fm_persistence.xlsx, with a guardrail assert matching the
+# originally observed console figures (diff=1.7845, t=5.92, T=30).
+_fm_persist = pd.read_excel(os.path.join(OUTPUT_DIR, 'fm_persistence.xlsx'), sheet_name='T4_FM_persistence')
+
+# Firm+quarter-FE robustness of the persistence test (firm_fe_persistence.py; see
+# that script's docstring). This is a standalone companion script whose output has
+# no code path into this table prior to this fix -- it was previously wired in by
+# hand-editing the committed .tex file directly.
+_firm_fe_persist = pd.read_excel(os.path.join(OUTPUT_DIR, 'firm_fe_persistence.xlsx'), sheet_name='firm_fe_persistence')
+
 _SLOAN_DV_LABELS = {
     'RG_LEAD': 'Future revenue growth $RG_{t+1}$ (\\%)',
     'OPINC_ROA_LEAD': 'Future operating ROA $OpInc_{t+1}/Assets_t$ (\\%)',
 }
+
+
+def _pval_inline(pval, decimals=3):
+    """Inline (bracket-free) p-value for embedding inside already-open $...$ math,
+    e.g. 'p<.001' or 'p=.004'. Mirrors _fmt_pval's precision/floor rule."""
+    if pd.isna(pval):
+        return ''
+    floor = 10 ** (-decimals)
+    if pval < floor:
+        return f"p<{floor:.{decimals}f}".replace('0.', '.', 1)
+    s = f"{pval:.{decimals}f}"
+    if s.startswith('0.'):
+        s = s[1:]
+    return f"p={s}"
+
+
+def _signed_num(v, decimals=4):
+    """Plain (non-LaTeX-macro) signed number for embedding inside already-open
+    $...$ math, where a literal '-' renders correctly as a minus sign (unlike
+    _fmt_coef's '$-$' macro, which is meant for use OUTSIDE an existing $...$ span)."""
+    if pd.isna(v):
+        return ''
+    sign = '-' if v < 0 else ''
+    return f"{sign}{abs(v):.{decimals}f}"
+
+
+def _sloan_fe_verdict(b_ret, b_acq, diff_p, alpha=0.05):
+    """Descriptive verdict for the firm+quarter-FE persistence row, derived from
+    its own coefficients and firm-clustered diff p-value. Mirrors
+    firm_fe_persistence.py's PASS / sign-only / FAIL logic (its survives_firmFE_gap
+    column) but adds a 'REVERSES' category for a statistically significant sign
+    flip (b_ret < b_acq with diff_p < alpha); firm_fe_persistence.py's own column
+    folds that case into a plain 'FAIL' without flagging that the reversal is
+    itself significant, which is exactly the paper's point about this row."""
+    significant = diff_p < alpha
+    if b_ret > b_acq:
+        return 'PASS (ret>acq, diff sig.)' if significant else 'sign-only (ret>acq, diff n.s.)'
+    return r'REVERSES (ret\textless{}acq, diff sig.)' if significant else 'FAIL (ret<=acq)'
 
 _tab_sloan_lines = []
 _tab_sloan_lines.append('\\begin{threeparttable}')
@@ -1775,10 +1866,47 @@ for _dv in ['RG_LEAD', 'OPINC_ROA_LEAD']:
             f"\\quad & & {_fmt_pval(_r['p_retention'])} & {_fmt_pval(_r['p_acquisition'])} & "
             f"{_fmt_pval(_r['diff_p_firmcl'])} & \\\\"
         )
+    if _dv == 'OPINC_ROA_LEAD':
+        # Firm+quarter-FE robustness row: strips out all time-invariant firm
+        # characteristics, identifying the retention-vs-acquisition gap from
+        # within-firm, quarter-to-quarter variation only (firm_fe_persistence.py).
+        _fe_row = _firm_fe_persist[
+            (_firm_fe_persist['DV'] == 'OPINC_ROA_LEAD') &
+            (_firm_fe_persist['Winsor'] == '1/99-winsorized') &
+            (_firm_fe_persist['FE'] == 'Firm + Quarter FE')
+        ].iloc[0]
+        _fe_verdict = _sloan_fe_verdict(_fe_row['b_retention'], _fe_row['b_acquisition'], _fe_row['diff_p_firmcl'])
+        _tab_sloan_lines.append(
+            f"\\quad & 1/99-w., firm + quarter FE & {_fmt_coef(_fe_row['b_retention'])} & "
+            f"{_fmt_coef(_fe_row['b_acquisition'])} & "
+            f"{_fmt_coef(_fe_row['diff_ret_minus_acq_firmcl'])} (${fmt(_fe_row['diff_t_firmcl'],2)}$) & {_fe_verdict} \\\\"
+        )
+        _se_ret_fe = _se_from_t(_fe_row['b_retention'], _fe_row['t_retention'])
+        _se_acq_fe = _se_from_t(_fe_row['b_acquisition'], _fe_row['t_acquisition'])
+        _tab_sloan_lines.append(
+            f"\\quad & & ({fmt(_se_ret_fe,4)}) & ({fmt(_se_acq_fe,4)}) & "
+            f"two-way $t={fmt(_fe_row['diff_t_twoway'],2)}$ & \\\\"
+        )
+        _tab_sloan_lines.append(
+            f"\\quad & & {_fmt_pval(_fe_row['p_retention'])} & {_fmt_pval(_fe_row['p_acquisition'])} & "
+            f"{_fmt_pval(_fe_row['diff_p_firmcl'])} & \\\\"
+        )
     _tab_sloan_lines.append('\\midrule')
 _tab_sloan_lines[-1] = '\\bottomrule'  # replace the trailing extra midrule
 _tab_sloan_lines.append('\\end{tabular}%')
 _tab_sloan_lines.append('}')
+_fm_focal = _fm_persist[(_fm_persist['DV'] == 'OPINC_ROA_LEAD') & (_fm_persist['Winsor'] == '1/99-winsorized')].iloc[0]
+_fm_T = int(_fm_focal['T_quarters'])
+_fm_diff_disp = _signed_num(_fm_focal['fm_diff_coef'], 4)
+_fm_t_disp = fmt(_fm_focal['fm_diff_t'], 2)
+_fm_p_disp = _pval_inline(_fm_focal['fm_diff_p'])
+
+_fe_diff_disp = _signed_num(_fe_row['diff_ret_minus_acq_firmcl'], 4)
+_fe_t_firmcl_disp = fmt(_fe_row['diff_t_firmcl'], 2)
+_fe_p_firmcl_disp = _pval_inline(_fe_row['diff_p_firmcl'])
+_fe_t_twoway_disp = fmt(_fe_row['diff_t_twoway'], 2)
+_fe_p_twoway_disp = _pval_inline(_fe_row['diff_p_twoway'])
+
 _tab_sloan_lines.append('\\begin{tablenotes}')
 _tab_sloan_lines.append('\\small')
 _tab_sloan_lines.append(
@@ -1790,15 +1918,28 @@ _tab_sloan_lines.append(
     r'$t$-statistic is shown on the row below for comparison. Exact $p$-values (firm-clustered) in '
     r'brackets on the third row; no significance stars. Pre-registered criterion: PASS requires '
     r'retention $b >$ acquisition $b$ and a significant firm-clustered diff. A Fama-MacBeth '
-    r'(cross-sectional-by-quarter) version of the diff.\ test, $T=30$ quarters, gives diff.\ '
-    r'$=1.7845$ ($t=5.92$, $p<.001$) for the operating-ROA, winsorized row -- printed to console by '
-    r'identification\_battery.py (Task 4) but not persisted to its committed workbook; re-verified by a '
-    r'clean re-run of the unmodified script (see canonical\_run\_manifest.json). '
-    r'The two dependent variables give an honestly mixed result: the operating-ROA leg passes the '
-    r'pre-registered criterion in both raw and winsorized form (retained revenue predicts future '
-    r'profitability more than acquired revenue does), while the revenue-growth leg is wrong-signed '
-    r'once winsorized (acquisition $b$ exceeds retention $b$) -- this is presented plainly as a mixed '
-    r'result, not a clean pass.'
+    rf'(cross-sectional-by-quarter) version of the diff.\ test, $T={_fm_T}$ quarters, gives diff.\ '
+    rf'$={_fm_diff_disp}$ ($t={_fm_t_disp}$, ${_fm_p_disp}$) for the operating-ROA, winsorized row; '
+    r'identification\_battery.py (Task 4) computes this statistic but never writes it to its own '
+    r'committed workbook, so fix\_fm\_persistence\_export.py persists it separately to '
+    r'output/fm\_persistence.xlsx (sheet T4\_FM\_persistence), with a guardrail assert confirming the '
+    r'value matches the originally observed console figure (see canonical\_run\_manifest.json). '
+    r'The two dependent variables give an honestly mixed result: the operating-ROA leg is '
+    r'sign-consistent with the pre-registered criterion in both raw and winsorized form (retained '
+    r'revenue predicts future profitability more than acquired revenue does) but earns a PASS only in '
+    r'the winsorized specification, where the diff is also statistically significant; the raw-data diff '
+    r'carries the correct sign but is not statistically significant. The revenue-growth leg is '
+    r'wrong-signed once winsorized (acquisition $b$ exceeds retention $b$) -- this is presented plainly '
+    r'as a mixed result, not a clean pass. '
+    r'The firm $+$ quarter FE row (source: firm\_fe\_persistence.xlsx) adds firm fixed effects to the '
+    r'winsorized operating-ROA specification, absorbing all cross-firm variation and identifying the '
+    r'retention-acquisition comparison purely from within-firm, quarter-to-quarter changes; the result '
+    rf'reverses sign and remains statistically significant (diff.\ $={_fe_diff_disp}$, firm-clustered '
+    rf'$t={_fe_t_firmcl_disp}$, ${_fe_p_firmcl_disp}$; two-way $t={_fe_t_twoway_disp}$, ${_fe_p_twoway_disp}$), so the '
+    r'quarter-FE-only PASS above reflects a between-firm pattern, larger, more established firms both '
+    r'retaining more revenue and earning more persistently profitable operating income, rather than a '
+    r'within-firm dynamic in which a given firm'"'"'s own profitability persistence tracks its own '
+    r'retention intensity over time.'
 )
 _tab_sloan_lines.append('\\end{tablenotes}')
 _tab_sloan_lines.append('\\end{threeparttable}')
