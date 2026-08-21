@@ -1,0 +1,13 @@
+pandas
+numpy
+scipy
+matplotlib
+seaborn
+scikit-learn
+statsmodels
+linearmodels
+xgboost
+openpyxl
+python-pptx
+stargazer
+PyMuPDF
