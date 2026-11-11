@@ -17,10 +17,8 @@ industry-adjusted panel -- the one actually used for the paper's main
 analysis) to Code/RRR-FI-IM/output/canonical_panel_<YYYYMMDD>.<ext>.
 
 Output format: parquet if a parquet engine (pyarrow or fastparquet) is
-installed, otherwise xlsx. As of 2026-07, neither pyarrow nor
-fastparquet is installed in the project interpreter
-(C:\\Users\\thkraft\\AppData\\Local\\Programs\\Python\\Python311\\python.exe),
-so this currently writes xlsx.
+installed, otherwise xlsx. Neither is installed in the project environment
+(Code/venv), so this currently writes xlsx.
 
 Usage:
     python save_canonical_panel.py
@@ -33,7 +31,7 @@ from datetime import date
 
 import pandas as pd
 
-CODE_DIR = r"C:\Users\thkraft\eCommerce-Goethe Dropbox\Thilo Kraft\Thilo(privat)\Privat\Research\RRR_FinancialImplication\Code\RRR-FI-IM"
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))   # Code/RRR-FI-IM
 
 sys.path.insert(0, CODE_DIR)
 import analysis_v2  # noqa: E402 -- import must follow sys.path setup
@@ -49,7 +47,10 @@ def _parquet_engine_available():
 
 def save_canonical_panel():
     """Run analysis_v2 Phase 1 once and persist df_filtered to a dated output file."""
-    df_long, df_filtered, industry_stats_df = analysis_v2.phase1_load_and_diagnose()
+    # phase 1 needs the Fama-French risk-free rate since the 2026-09-08
+    # data vintage, so the factor load has to happen first.
+    ff_factors = analysis_v2.phase1b_load_ff_factors()
+    df_long, df_filtered, industry_stats_df = analysis_v2.phase1_load_and_diagnose(ff_factors)
 
     # FIRM and DATE move from MultiIndex to plain columns for on-disk storage.
     panel_to_save = df_filtered.reset_index()

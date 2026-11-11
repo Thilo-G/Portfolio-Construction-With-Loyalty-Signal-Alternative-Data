@@ -1,4 +1,24 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Data and every generated output stay out of version control. The card data
+# are licensed, and output/ holds firm-level panels derived from them.
+Data/
+output/
+*.xlsx
+*.xls
+*.csv
+*.parquet
+*.pkl
+# The one CSV that is configuration rather than data: the per-firm Bloomberg
+# quarter offsets that detect_bloomberg_offsets.py stores (tickers and integers).
+!config/bloomberg_stamping_offsets.csv
+
+# Run logs, local backups, and the local archive of retired code
+_runlogs/
+_backup*/
+_snapshot*/
+archive/

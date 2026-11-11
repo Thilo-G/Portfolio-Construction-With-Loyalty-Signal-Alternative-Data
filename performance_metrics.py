@@ -6,12 +6,8 @@ Task 1: Full performance/risk metrics battery (Sharpe, Sortino, tracking error,
         rolling drawdown, rolling upside-capture, max drawdown) for the RRR
         quartile portfolios (Q1-Q4) and the long-short, under the corrected
         k=2-month-formation-gap / 3-month-hold timing.
-Task 2: Share of Retained Revenue (SoRR = ADJ_SRR_PCT) subsection -- verifies
-        the signal is unaffected by the timing rebuild, sorts on it under the
-        identical corrected timing, reports its long-short FF3/FF5 alpha, and
-        directly quantifies the "SoRR is a low-turnover, stable signal" claim
-        against RRR (signal-level turnover, quartile-transition stability, and
-        the RRR-SoRR correlation implied by their shared numerator).
+        (A second task on the share of returning revenue was removed on
+        2026-11-11; the paper reports that signal only as a robustness row.)
 
 This script imports build_holding_panel(), build_portfolio_returns(),
 value_weighted_market(), run_factor_regressions(), safe_quartile(), and
@@ -29,7 +25,7 @@ Modeling choices made explicit here (see also the printed run header):
     whole battery. NOTE: this differs from analysis_v2.run_risk_analysis(),
     which uses the Fama-French Mkt-RF (broad CRSP) series for downside beta;
     the two are not directly comparable.
-  * The headline RRR signal is ADJ_RRR_PCT (industry x time adjusted), the
+  * The headline RRR signal is RRR_PCT (raw, author decision 2026-09-18), the
     project's stated main-result signal (see project CLAUDE.md).
   * Sharpe and Sortino are computed on returns in excess of the Ken French
     monthly RF; the Q1-Q4 long-short is already zero-cost, so RF cancels out
@@ -48,7 +44,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-CODE_DIR = r"C:\Users\thkraft\eCommerce-Goethe Dropbox\Thilo Kraft\Thilo(privat)\Privat\Research\RRR_FinancialImplication\Code\RRR-FI-IM"
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))   # Code/RRR-FI-IM
 sys.path.insert(0, CODE_DIR)
 
 from analysis_v2 import (
@@ -72,15 +68,17 @@ from analysis_v2 import (
 MONTHS_PER_YEAR = 12
 ROLLING_WINDOW_MONTHS = 12          # trailing window for the rolling upside-capture series
 MIN_OBS_CONDITIONAL_BETA = 6        # minimum down-/up-months required to fit a conditional beta
-SRR_VERIFY_TOL = 1e-8               # tolerance for the SRR_PCT / ADJ_SRR_PCT recompute check
 
 QUARTILE_COLS = ['Q1', 'Q2', 'Q3', 'Q4']
 LONG_SHORT_COL = 'Q1-Q4'
 MARKET_COL = 'MKT'
 REPORT_COLS = QUARTILE_COLS + [LONG_SHORT_COL, MARKET_COL]
 
-RRR_SIGNAL_COL = 'ADJ_RRR_PCT'      # headline signal: industry x time adjusted RRR
-SRR_SIGNAL_COL = 'ADJ_SRR_PCT'      # headline signal: industry x time adjusted SoRR
+# Quarterly re-formation: four portfolio rebuilds per calendar year. Used to put
+# turnover on an annual basis so it can be compared with the annual-signal test.
+REFORMATIONS_PER_YEAR = 4
+
+RRR_SIGNAL_COL = 'RRR_PCT'          # headline signal: raw is the paper's primary specification (author decision 2026-09-18)
 
 ROW_ORDER = [
     'Ann Return (%)',
@@ -89,10 +87,13 @@ ROW_ORDER = [
     'Sortino Ratio',
     'Tracking Error (%)',
     'Information Ratio',
+    'Appraisal Ratio (FF3)',
+    'Appraisal Ratio (FF5)',
     'Downside Beta',
     'Upside Beta',
     'Max Drawdown (%)',
     'Turnover (avg qtrly, %)',
+    'Turnover (annualized, %)',
     'Hit Rate vs Market (%)',
     'Hit Rate vs Q4 (%)',
     'N (months)',
@@ -103,12 +104,15 @@ METRIC_NOTES = {
     'Ann Vol (%)': "Annualized standard deviation of monthly returns; total risk, the denominator of the Sharpe ratio.",
     'Sharpe Ratio': "Return per unit of total risk, in excess of the risk-free rate; the standard risk-adjusted-return benchmark.",
     'Sortino Ratio': "Like Sharpe, but the denominator counts only downside volatility, so large positive swings are not treated as 'risk'; isolates bad-state variance.",
-    'Tracking Error (%)': "Volatility of the portfolio's return relative to the sample's own value-weighted market portfolio; how much the strategy deviates from the market, in either direction.",
-    'Information Ratio': "Active return over tracking error relative to the sample's own market portfolio; distinguishes consistent skill from noisy market exposure.",
+    'Tracking Error (%)': "Volatility of active return. For the long-only quartiles, active return is measured against the sample's own value-weighted market portfolio. For the zero-cost Q1-Q4 spread there is no long-only benchmark to deviate from, so tracking error is the spread's own annualized volatility -- the standard market-neutral convention.",
+    'Information Ratio': "Active return divided by tracking error. Long-only quartiles are benchmarked on the sample market. The zero-cost Q1-Q4 spread is self-benchmarked (annualized mean divided by annualized volatility), because comparing a dollar-neutral book against a long-only market index mixes two different exposures and understates the strategy.",
+    'Appraisal Ratio (FF3)': "Annualized factor-model alpha divided by annualized residual volatility from the FF3 regression; risk-adjusted skill per unit of idiosyncratic risk, the benchmark-free counterpart to the information ratio.",
+    'Appraisal Ratio (FF5)': "Same as above, estimated on the Fama-French five-factor model.",
     'Downside Beta': "Beta on the sample market estimated only in months the sample market fell; how much of the portfolio's decline is systematic (market-driven) risk.",
     'Upside Beta': "Beta on the sample market estimated only in months the sample market rose; a portfolio with upside beta > downside beta has asymmetric, favorable market exposure.",
     'Max Drawdown (%)': "Largest peak-to-trough decline in cumulative value; a path-dependent tail-risk measure that volatility alone does not capture.",
     'Turnover (avg qtrly, %)': "Fraction of portfolio value traded at each quarterly re-formation (0.5 x sum of |weight changes|, new formation weights vs. prior weights drifted by realized returns); the implicit trading/implementability cost of the strategy.",
+    'Turnover (annualized, %)': "One-way turnover per calendar year: the per-reformation figure above times the number of reformations per year (four for the quarterly strategy, one for the annual-signal strategy). Stated so that strategies rebalanced at different frequencies can be compared on the same basis.",
     'Hit Rate vs Market (%)': "Fraction of months the portfolio outperforms the sample market; a simple, distribution-free consistency measure.",
     'Hit Rate vs Q4 (%)': "Fraction of months Q1 outperforms Q4; tests directly whether the long-short edge is persistent or concentrated in a few months (headline number: the Q1 column).",
     'N (months)': "Sample size underlying every ratio above (months with both a valid sample-market return and a valid Ken French risk-free rate).",
@@ -161,6 +165,39 @@ def tracking_error(port_ret, mkt_ret):
     """Annualized standard deviation of the active return (portfolio - sample market)."""
     active = (port_ret - mkt_ret).dropna()
     return active.std(ddof=1) * np.sqrt(MONTHS_PER_YEAR)
+
+
+def self_information_ratio(port_ret):
+    """Information ratio for a zero-cost (dollar-neutral) portfolio.
+
+    A long-short spread has no long-only benchmark it is trying to track, so the
+    active return IS the portfolio return and the tracking error IS its own
+    volatility. Benchmarking the spread against a long-only market portfolio, as
+    the generic information_ratio() below does, mixes a market-neutral book with
+    a directional index and materially understates it.
+    """
+    r = port_ret.dropna()
+    vol = r.std(ddof=1) * np.sqrt(MONTHS_PER_YEAR)
+    mu = r.mean() * MONTHS_PER_YEAR
+    return mu / vol if vol > 0 else np.nan
+
+
+def appraisal_ratio(port_excess_ret, factor_df, factor_cols):
+    """Annualized alpha divided by annualized residual volatility (Treynor-Black).
+
+    Benchmark-free measure of skill per unit of idiosyncratic risk: it asks how
+    much alpha the strategy delivers relative to the diversifiable risk taken to
+    get it, which is exactly what a portfolio manager sizing the position needs.
+    """
+    aligned = pd.concat([port_excess_ret, factor_df[factor_cols]], axis=1).dropna()
+    if len(aligned) < len(factor_cols) + 5:
+        return np.nan
+    y = aligned.iloc[:, 0]
+    X = sm.add_constant(aligned[factor_cols])
+    fit = sm.OLS(y, X).fit()
+    alpha_ann = fit.params['const'] * MONTHS_PER_YEAR
+    resid_vol_ann = fit.resid.std(ddof=len(fit.params)) * np.sqrt(MONTHS_PER_YEAR)
+    return alpha_ann / resid_vol_ann if resid_vol_ann > 0 else np.nan
 
 
 def information_ratio(port_ret, mkt_ret):
@@ -240,7 +277,8 @@ def rolling_upside_capture(port_ret, mkt_ret, window=ROLLING_WINDOW_MONTHS):
 # SECTION B -- TURNOVER
 # =============================================================================
 
-def compute_portfolio_turnover(panel, bucket_col):
+def compute_portfolio_turnover(panel, bucket_col, quarters_between=1,
+                               reformations_per_year=None):
     """Strategy turnover: the fraction of portfolio VALUE that must be traded at
     each quarterly rebalance (does not exist elsewhere in the project; built here).
 
@@ -250,8 +288,15 @@ def compute_portfolio_turnover(panel, bucket_col):
       * w_end_i,t-1 = firm i's weight in the OUTGOING quarter's bucket, DRIFTED
                        forward by that firm's realized compounded holding-period
                        return (no interim trading), then renormalized to sum to 1.
-    Averaged over all quarterly rebalances between calendar-adjacent quarters
-    (transitions across a data gap, if any, are excluded and counted separately).
+    Averaged over all rebalances that are exactly ``quarters_between`` calendar
+    quarters apart (transitions across a data gap are excluded and counted
+    separately). ``quarters_between`` is 1 for the quarterly baseline and 4 for
+    the annual-signal strategy, whose formations sit a year apart; leaving it at
+    1 there would silently discard every transition and return NaN turnover.
+
+    ``reformations_per_year`` (4 quarterly, 1 annual) is carried through so the
+    caller can also state turnover on an annual basis, which is the only way to
+    compare strategies rebalanced at different frequencies.
     Bounded in [0, 1] for a single long (or short) leg. Turnover of the Q1-Q4
     long-short is reported as the SUM of the two legs' turnover (both legs must be
     traded independently each quarter).
@@ -280,7 +325,7 @@ def compute_portfolio_turnover(panel, bucket_col):
     for q_prev, q_curr in zip(quarters[:-1], quarters[1:]):
         p_prev = pd.Timestamp(q_prev).to_period('Q')
         p_curr = pd.Timestamp(q_curr).to_period('Q')
-        if (p_curr.ordinal - p_prev.ordinal) != 1:
+        if (p_curr.ordinal - p_prev.ordinal) != quarters_between:
             n_skipped_gap += 1
             continue
         for b in QUARTILE_COLS:
@@ -313,125 +358,12 @@ def compute_portfolio_turnover(panel, bucket_col):
     turnover_avg[LONG_SHORT_COL] = turnover_avg['Q1'] + turnover_avg['Q4']
     turnover_n[LONG_SHORT_COL] = min(turnover_n['Q1'], turnover_n['Q4'])
 
-    return turnover_avg, turnover_n, turnover_detail, n_skipped_gap
+    if reformations_per_year is None:
+        reformations_per_year = REFORMATIONS_PER_YEAR
+    turnover_annual = {b: (v * reformations_per_year if v == v else np.nan)
+                       for b, v in turnover_avg.items()}
 
-
-def signal_level_turnover(df_filtered, signal_col):
-    """SIGNAL-level (not $-weighted-portfolio-level) quarter-to-quarter turnover of
-    a cross-sectional signal: (a) mean/median absolute quarter-to-quarter change in
-    the signal value per firm, in percentage points and normalized by the signal's
-    own average cross-sectional SD; (b) the fraction of firms whose quartile bucket
-    (sorted within quarter via safe_quartile, Q1=highest, matching the portfolio-
-    sort convention used everywhere else) differs from the prior quarter (churn),
-    and its complement (stay rate)."""
-    d = df_filtered[[signal_col]].copy()
-    d[signal_col] = pd.to_numeric(d[signal_col], errors='coerce')
-    d = d.reset_index().sort_values(['FIRM', 'DATE'])
-
-    d['PRIOR_VAL'] = d.groupby('FIRM')[signal_col].shift(1)
-    d['ABS_CHANGE'] = (d[signal_col] - d['PRIOR_VAL']).abs()
-
-    cross_sectional_sd = d.groupby('DATE')[signal_col].std().mean()
-
-    q_col = '_QBUCKET'
-    d[q_col] = d.groupby('DATE')[signal_col].transform(safe_quartile)
-    d['PRIOR_Q'] = d.groupby('FIRM')[q_col].shift(1)
-    valid_q = d.dropna(subset=[q_col, 'PRIOR_Q'])
-    stay_rate = (valid_q[q_col] == valid_q['PRIOR_Q']).mean()
-
-    per_q_stay = {}
-    for q in QUARTILE_COLS:
-        sub = valid_q[valid_q['PRIOR_Q'] == q]
-        per_q_stay[q] = (sub[q_col] == q).mean() if len(sub) > 0 else np.nan
-
-    return {
-        'signal': signal_col,
-        'mean_abs_change_pp': d['ABS_CHANGE'].mean(),
-        'median_abs_change_pp': d['ABS_CHANGE'].median(),
-        'cross_sectional_sd_pp': cross_sectional_sd,
-        'mean_abs_change_norm': (d['ABS_CHANGE'].mean() / cross_sectional_sd
-                                  if cross_sectional_sd else np.nan),
-        'quartile_stay_rate': stay_rate,
-        'quartile_churn_rate': 1 - stay_rate,
-        'per_quartile_stay_rate': per_q_stay,
-        'n_firm_quarter_changes': int(d['ABS_CHANGE'].notna().sum()),
-        'n_quartile_transitions': int(len(valid_q)),
-    }
-
-
-# =============================================================================
-# SECTION C -- SoRR-SPECIFIC VERIFICATION
-# =============================================================================
-
-def verify_srr_computation(df_filtered):
-    """Confirm SRR_PCT / ADJ_SRR_PCT still compute correctly after the timing
-    rebuild. Two independent checks, since the timing fix (commit 1fce67f) only
-    touched build_holding_panel()/portfolio formation, not Phase 1's signal
-    construction, so this is expected to be unaffected -- verified, not assumed:
-      (1) Recompute SRR_PCT = (#RETURNING_CUSTOMERS / #TOTAL_REVENUE) * 100 and
-          ADJ_SRR_PCT = SRR_PCT - (sector x quarter mean) directly from the raw
-          columns and compare to the stored values.
-      (2) Cross-check SRR_PCT/100 against the INDEPENDENTLY-SOURCED raw field
-          #SHARE_RET_REVENUE (present in the underlying data extract, not
-          derived by this pipeline), if available.
-    """
-    ret = pd.to_numeric(df_filtered['#RETURNING_CUSTOMERS'], errors='coerce')
-    tot = pd.to_numeric(df_filtered['#TOTAL_REVENUE'], errors='coerce')
-    srr_recomputed = (ret / tot.replace(0, np.nan)) * 100
-    stored_srr = pd.to_numeric(df_filtered['SRR_PCT'], errors='coerce')
-    diff = (srr_recomputed - stored_srr).abs()
-
-    sector_quarter_mean = df_filtered.groupby(
-        [df_filtered.index.get_level_values('DATE'), 'SECTOR'])['SRR_PCT'].transform('mean')
-    adj_recomputed = df_filtered['SRR_PCT'] - sector_quarter_mean
-    stored_adj = pd.to_numeric(df_filtered['ADJ_SRR_PCT'], errors='coerce')
-    diff_adj = (adj_recomputed - stored_adj).abs()
-
-    out = {
-        'srr_max_abs_diff': float(diff.max()),
-        'srr_n_mismatch': int((diff > SRR_VERIFY_TOL).sum()),
-        'srr_n_total': int(stored_srr.notna().sum()),
-        'adj_srr_max_abs_diff': float(diff_adj.max()),
-        'adj_srr_n_mismatch': int((diff_adj > SRR_VERIFY_TOL).sum()),
-        'adj_srr_n_total': int(stored_adj.notna().sum()),
-    }
-
-    if '#SHARE_RET_REVENUE' in df_filtered.columns:
-        share_raw = pd.to_numeric(df_filtered['#SHARE_RET_REVENUE'], errors='coerce')
-        comp = pd.concat([share_raw, stored_srr / 100], axis=1).dropna()
-        comp.columns = ['share_raw', 'srr_over_100']
-        out['independent_source_corr'] = float(comp['share_raw'].corr(comp['srr_over_100']))
-        out['independent_source_max_abs_diff'] = float(
-            (comp['share_raw'] - comp['srr_over_100']).abs().max())
-        out['independent_source_n'] = int(len(comp))
-    else:
-        out['independent_source_corr'] = np.nan
-        out['independent_source_max_abs_diff'] = np.nan
-        out['independent_source_n'] = 0
-
-    return out
-
-
-def rrr_sorr_correlation(df_filtered):
-    """Mechanical-relationship check: RRR_PCT = retained / PRIOR-period total revenue;
-    SRR_PCT = retained / CURRENT-period total revenue. Both share the same numerator
-    (retained revenue), so higher RRR should be associated with higher SoRR whenever
-    revenue is not shrinking sharply. Reports Pearson and Spearman correlations for
-    both the raw and the industry x time adjusted signal pairs."""
-    d = df_filtered[['RRR_PCT', 'SRR_PCT', 'ADJ_RRR_PCT', 'ADJ_SRR_PCT']].apply(
-        pd.to_numeric, errors='coerce')
-
-    raw = d[['RRR_PCT', 'SRR_PCT']].dropna()
-    adj = d[['ADJ_RRR_PCT', 'ADJ_SRR_PCT']].dropna()
-
-    return {
-        'pearson_raw': float(raw['RRR_PCT'].corr(raw['SRR_PCT'], method='pearson')),
-        'spearman_raw': float(raw['RRR_PCT'].corr(raw['SRR_PCT'], method='spearman')),
-        'n_raw': int(len(raw)),
-        'pearson_adj': float(adj['ADJ_RRR_PCT'].corr(adj['ADJ_SRR_PCT'], method='pearson')),
-        'spearman_adj': float(adj['ADJ_RRR_PCT'].corr(adj['ADJ_SRR_PCT'], method='spearman')),
-        'n_adj': int(len(adj)),
-    }
+    return turnover_avg, turnover_n, turnover_detail, n_skipped_gap, turnover_annual
 
 
 # =============================================================================
@@ -462,6 +394,16 @@ def build_task1_metrics_table(panel, ff_factors, market_ret, signal_col, bucket_
 
     ann_return, ann_vol, sharpe, sortino = {}, {}, {}, {}
     te, ir, dbeta, ubeta, mdd = {}, {}, {}, {}, {}
+    ar3, ar5 = {}, {}
+
+    # Factor panel for the appraisal ratios, aligned to the same months.
+    FF3_COLS = ['Mkt-RF', 'SMB', 'HML']
+    FF5_COLS = ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA']
+    combined_ff = ff_factors.reindex(combined.index)
+    FF3_OK = all(c in combined_ff.columns for c in FF3_COLS)
+    FF5_OK = all(c in combined_ff.columns for c in FF5_COLS)
+    if not FF5_OK:
+        print("    NOTE: FF5 columns unavailable; Appraisal Ratio (FF5) will be blank.")
     hit_mkt, hit_q4 = {}, {}
     n_down_diag, n_up_diag = {}, {}
 
@@ -475,8 +417,17 @@ def build_task1_metrics_table(panel, ff_factors, market_ret, signal_col, bucket_
         sharpe[col] = sharpe_ratio(ex)
         sortino[col] = sortino_ratio(ex)
 
-        te[col] = tracking_error(raw, mkt_ret_aligned) * 100
-        ir[col] = information_ratio(raw, mkt_ret_aligned)
+        # Zero-cost spreads are self-benchmarked; long-only legs keep the
+        # market-relative convention. See self_information_ratio().
+        if col == LONG_SHORT_COL:
+            te[col] = raw.dropna().std(ddof=1) * np.sqrt(MONTHS_PER_YEAR) * 100
+            ir[col] = self_information_ratio(raw)
+        else:
+            te[col] = tracking_error(raw, mkt_ret_aligned) * 100
+            ir[col] = information_ratio(raw, mkt_ret_aligned)
+
+        ar3[col] = appraisal_ratio(ex, combined_ff, FF3_COLS) if FF3_OK else np.nan
+        ar5[col] = appraisal_ratio(ex, combined_ff, FF5_COLS) if FF5_OK else np.nan
 
         db, ndn = conditional_beta(raw, mkt_ret_aligned, 'down')
         ub, nup = conditional_beta(raw, mkt_ret_aligned, 'up')
@@ -497,13 +448,22 @@ def build_task1_metrics_table(panel, ff_factors, market_ret, signal_col, bucket_
             hit_mkt[col] = hit_rate(raw, mkt_ret_aligned) * 100
             hit_q4[col] = hit_rate(raw, combined['Q4']) * 100 if col != 'Q4' else 0.0
 
-    turnover_avg, turnover_n, turnover_detail, n_skipped_gap = compute_portfolio_turnover(
-        panel, bucket_col_name)
+    (turnover_avg, turnover_n, turnover_detail, n_skipped_gap,
+     turnover_annual) = compute_portfolio_turnover(
+        panel, bucket_col_name,
+        quarters_between=1, reformations_per_year=REFORMATIONS_PER_YEAR)
     print(f"    Turnover: {turnover_n} quarterly transitions used per bucket "
           f"({n_skipped_gap} calendar-gap transitions skipped)")
 
     turnover_row = {c: (turnover_avg.get(c, np.nan) * 100 if c in turnover_avg else np.nan)
                     for c in REPORT_COLS}
+    # Annualised one-way turnover. The quarterly strategy re-forms four times a
+    # year; stating it per year makes it directly comparable to the annual-signal
+    # strategy, which re-forms once.
+    turnover_row_ann = {c: (turnover_annual.get(c, np.nan) * 100
+                            if c in turnover_annual and turnover_annual[c] == turnover_annual[c]
+                            else np.nan)
+                        for c in REPORT_COLS}
 
     n_row = {c: n_months for c in REPORT_COLS}
 
@@ -516,8 +476,11 @@ def build_task1_metrics_table(panel, ff_factors, market_ret, signal_col, bucket_
         'Information Ratio': ir,
         'Downside Beta': dbeta,
         'Upside Beta': ubeta,
+        'Appraisal Ratio (FF3)': ar3,
+        'Appraisal Ratio (FF5)': ar5,
         'Max Drawdown (%)': mdd,
         'Turnover (avg qtrly, %)': turnover_row,
+        'Turnover (annualized, %)': turnover_row_ann,
         'Hit Rate vs Market (%)': hit_mkt,
         'Hit Rate vs Q4 (%)': hit_q4,
         'N (months)': n_row,
@@ -540,10 +503,7 @@ def sanity_check_against_pipeline(panel, ff_factors, port_adj):
     pipeline's OWN entry point for the headline ADJ RRR Q1-Q4 sort (form_lag=2,
     the module default). It is not saved to any tracked output file (its
     run_factor_regressions() call result is discarded, printed only), so there is
-    no pre-existing reference number for the headline sort to compare against --
-    NOTE: output/factor_reg_Lag2_adj.xlsx is NOT that reference; it is written by
-    the separate run_extra_lag_portfolios() robustness test, which deliberately
-    forms 5 months (not 2) after quarter-end and is EXPECTED to differ.
+    no pre-existing reference number for the headline sort to compare against.
 
     Instead, call run_portfolio_analysis() directly on the same panel and compare
     its returned port_rrr_adj_q4_vw DataFrame to this script's own `port_adj`
@@ -568,106 +528,8 @@ def sanity_check_against_pipeline(panel, ff_factors, port_adj):
               f"identical_on_overlap={identical}")
     print(f"    -> {'PASS: portfolio construction matches the pipeline exactly' if all_match else 'FAIL: investigate divergence'}")
 
-    # Also report the extra-lag robustness file for context (NOT expected to match).
-    ref_path = os.path.join(OUTPUT_DIR, 'factor_reg_Lag2_adj.xlsx')
-    if os.path.exists(ref_path):
-        ref = pd.read_excel(ref_path, engine='openpyxl').set_index('Unnamed: 0')
-        if 'Q1-Q4_FF3' in ref.index:
-            print(f"    (context only, NOT a match target: extra-lag [5mo] robustness Q1-Q4 FF3 "
-                  f"alpha={ref.loc['Q1-Q4_FF3', 'alpha']*100:.4f}%/mo, t={ref.loc['Q1-Q4_FF3', 'alpha_t']:.4f})")
 
-
-def run_task2_sorr(df_filtered, panel, ff_factors, market_ret):
-    """Task 2: SoRR (ADJ_SRR_PCT) subsection."""
-    print("\n" + "=" * 80)
-    print("TASK 2: SHARE OF RETAINED REVENUE (SoRR) SUBSECTION")
-    print("=" * 80)
-
-    print("\n  --- 2.1 Verify SRR_PCT / ADJ_SRR_PCT after the timing rebuild ---")
-    verify = verify_srr_computation(df_filtered)
-    print(f"    SRR_PCT recompute:      max|diff|={verify['srr_max_abs_diff']:.2e}, "
-          f"mismatches={verify['srr_n_mismatch']}/{verify['srr_n_total']}")
-    print(f"    ADJ_SRR_PCT recompute:  max|diff|={verify['adj_srr_max_abs_diff']:.2e}, "
-          f"mismatches={verify['adj_srr_n_mismatch']}/{verify['adj_srr_n_total']}")
-    print(f"    Independent source (#SHARE_RET_REVENUE) vs SRR_PCT/100: "
-          f"corr={verify['independent_source_corr']:.10f}, "
-          f"max|diff|={verify['independent_source_max_abs_diff']:.2e}, "
-          f"N={verify['independent_source_n']}")
-
-    print("\n  --- 2.2 Portfolio sort on ADJ_SRR_PCT, same corrected timing ---")
-    panel = panel.copy()
-    panel[SRR_SIGNAL_COL] = pd.to_numeric(panel[SRR_SIGNAL_COL], errors='coerce')
-    panel['SRR_Q'] = panel.groupby('QUARTER')[SRR_SIGNAL_COL].transform(safe_quartile)
-    # Also (re)build the RRR quartile bucket on this same panel copy, needed for the
-    # 2.3b $-turnover comparison below. build_task1_metrics_table() computes this on
-    # its OWN internal copy of panel and does not mutate/return the caller's panel,
-    # so it is not already present here -- recomputed explicitly rather than relying
-    # on a cross-function side effect.
-    panel[RRR_SIGNAL_COL] = pd.to_numeric(panel[RRR_SIGNAL_COL], errors='coerce')
-    panel['RRR_Q_ADJ'] = panel.groupby('QUARTER')[RRR_SIGNAL_COL].transform(safe_quartile)
-    port_srr = build_portfolio_returns(panel, 'SRR_Q', market_ret)
-    if port_srr is None:
-        raise RuntimeError("build_portfolio_returns returned None for SoRR sort")
-
-    ff_srr = run_factor_regressions(port_srr, ff_factors, 'SoRR (ADJ_SRR_PCT) Q1-Q4 VW')
-
-    alpha_summary = {}
-    for spec in ['FF3', 'FF3+Mom', 'FF5']:
-        key = f'{LONG_SHORT_COL}_{spec}'
-        if key in ff_srr:
-            r = ff_srr[key]
-            alpha_summary[spec] = {
-                'alpha_pct_month': r['alpha'] * 100,
-                'alpha_pct_annual': r['alpha'] * 100 * MONTHS_PER_YEAR,
-                'se_pct': r['se_alpha'] * 100,
-                't_stat': r['alpha_t'],
-                'p_value': r['alpha_p'],
-                'r2': r['r2'],
-                'n_obs': r['n_obs'],
-            }
-            print(f"    Q1-Q4 {spec}: alpha={r['alpha']*100:.4f}%/mo "
-                  f"({r['alpha']*100*MONTHS_PER_YEAR:.4f}%/yr), SE={r['se_alpha']*100:.4f}, "
-                  f"t={r['alpha_t']:.4f}, p=[{r['alpha_p']:.4f}], R2={r['r2']:.4f}, N={r['n_obs']:.0f}")
-
-    print("\n  --- 2.3 Signal-level turnover: SoRR vs RRR ---")
-    rrr_turnover = signal_level_turnover(df_filtered, RRR_SIGNAL_COL)
-    srr_turnover = signal_level_turnover(df_filtered, SRR_SIGNAL_COL)
-    for label, stats in [('ADJ_RRR_PCT', rrr_turnover), ('ADJ_SRR_PCT', srr_turnover)]:
-        print(f"    {label}: mean|change|={stats['mean_abs_change_pp']:.4f}pp "
-              f"(median={stats['median_abs_change_pp']:.4f}pp), "
-              f"cross-sec SD={stats['cross_sectional_sd_pp']:.4f}pp, "
-              f"normalized change={stats['mean_abs_change_norm']:.4f}, "
-              f"quartile stay-rate={stats['quartile_stay_rate']*100:.2f}%, "
-              f"churn-rate={stats['quartile_churn_rate']*100:.2f}% (N={stats['n_quartile_transitions']})")
-
-    print("\n  --- 2.3b (bonus) $-weighted portfolio turnover: SoRR-sorted vs RRR-sorted quartiles ---")
-    rrr_port_turnover, rrr_port_n, _, _ = compute_portfolio_turnover(panel, 'RRR_Q_ADJ')
-    srr_port_turnover, srr_port_n, _, _ = compute_portfolio_turnover(panel, 'SRR_Q')
-    for b in QUARTILE_COLS + [LONG_SHORT_COL]:
-        print(f"    {b}: RRR-sorted turnover={rrr_port_turnover[b]*100:.4f}%  "
-              f"vs  SoRR-sorted turnover={srr_port_turnover[b]*100:.4f}%")
-
-    print("\n  --- 2.4 Mechanical relationship: RRR vs SoRR correlation ---")
-    corr = rrr_sorr_correlation(df_filtered)
-    print(f"    Raw:      Pearson={corr['pearson_raw']:.4f}, Spearman={corr['spearman_raw']:.4f} "
-          f"(N={corr['n_raw']})")
-    print(f"    Adjusted: Pearson={corr['pearson_adj']:.4f}, Spearman={corr['spearman_adj']:.4f} "
-          f"(N={corr['n_adj']})")
-
-    return {
-        'verify': verify,
-        'port_srr': port_srr,
-        'ff_srr': ff_srr,
-        'alpha_summary': alpha_summary,
-        'rrr_turnover': rrr_turnover,
-        'srr_turnover': srr_turnover,
-        'rrr_port_turnover': rrr_port_turnover,
-        'srr_port_turnover': srr_port_turnover,
-        'corr': corr,
-    }
-
-
-def save_outputs(table1, drawdown_df, upside_capture_df, task2_results):
+def save_outputs(table1, drawdown_df, upside_capture_df):
     """Persist all deliverables to output/ as explicitly-named files, so they can be
     git-added individually (never via a blanket `git add -A`)."""
 
@@ -687,38 +549,6 @@ def save_outputs(table1, drawdown_df, upside_capture_df, task2_results):
     upside_capture_df.to_excel(upside_path, sheet_name='UpsideCapture_pct', engine='openpyxl')
     print(f"  Saved: {upside_path}")
 
-    sorr_path = os.path.join(OUTPUT_DIR, 'performance_sorr_summary.xlsx')
-    with pd.ExcelWriter(sorr_path, engine='openpyxl') as writer:
-        pd.DataFrame([task2_results['verify']]).to_excel(writer, sheet_name='SRR_Verification', index=False)
-
-        alpha_rows = []
-        for spec, vals in task2_results['alpha_summary'].items():
-            row = {'Spec': spec}
-            row.update(vals)
-            alpha_rows.append(row)
-        pd.DataFrame(alpha_rows).to_excel(writer, sheet_name='SoRR_LongShort_Alpha', index=False)
-
-        turnover_rows = []
-        for label, stats in [('ADJ_RRR_PCT', task2_results['rrr_turnover']),
-                              ('ADJ_SRR_PCT', task2_results['srr_turnover'])]:
-            row = {k: v for k, v in stats.items() if k != 'per_quartile_stay_rate'}
-            for q, v in stats['per_quartile_stay_rate'].items():
-                row[f'stay_rate_{q}'] = v
-            turnover_rows.append(row)
-        pd.DataFrame(turnover_rows).to_excel(writer, sheet_name='Signal_Turnover_Comparison', index=False)
-
-        if task2_results['rrr_port_turnover'] is not None:
-            port_to_rows = []
-            for b in QUARTILE_COLS + [LONG_SHORT_COL]:
-                port_to_rows.append({
-                    'Bucket': b,
-                    'RRR_sorted_turnover_avg': task2_results['rrr_port_turnover'][b],
-                    'SoRR_sorted_turnover_avg': task2_results['srr_port_turnover'][b],
-                })
-            pd.DataFrame(port_to_rows).to_excel(writer, sheet_name='Portfolio_Turnover_Comparison', index=False)
-
-        pd.DataFrame([task2_results['corr']]).to_excel(writer, sheet_name='RRR_SoRR_Correlation', index=False)
-    print(f"  Saved: {sorr_path}")
 
 
 def main():
@@ -728,13 +558,14 @@ def main():
           "(build_holding_panel(), analysis_v2.py, commit 1fce67f)")
     print("Market benchmark for all relative metrics: sample's own value-weighted "
           "market portfolio (NOT the S&P 500)")
-    print("Headline RRR signal: ADJ_RRR_PCT (industry x time adjusted)")
+    print("Headline RRR signal: RRR_PCT (raw)")
     print("=" * 80)
 
     # ---- Load data via analysis_v2 (single source of truth for loading/timing) ----
-    print("\n[1/4] Loading Phase 1 panel, FF factors, monthly returns, holding panel ...")
-    df_long, df_filtered, industry_stats = phase1_load_and_diagnose()
+    print("\n[1/3] Loading Phase 1 panel, FF factors, monthly returns, holding panel ...")
+    # Factors first: phase 1 needs the FF risk-free rate.
     ff_factors = phase1b_load_ff_factors()
+    df_long, df_filtered, industry_stats = phase1_load_and_diagnose(ff_factors)
     returns = phase1c_load_monthly_returns()
     panel = build_holding_panel(df_filtered, returns)
     market_ret = value_weighted_market(panel)
@@ -743,12 +574,12 @@ def main():
     # TASK 1
     # =========================================================================
     print("\n" + "=" * 80)
-    print("TASK 1: PERFORMANCE / RISK METRICS BATTERY (ADJ RRR quartiles)")
+    print("TASK 1: PERFORMANCE / RISK METRICS BATTERY (raw RRR quartiles)")
     print("=" * 80)
-    print("\n[2/4] Building ADJ-RRR quartile portfolios and the full metrics battery ...")
+    print("\n[2/3] Building RRR quartile portfolios and the full metrics battery ...")
     (table1, combined1, drawdown_df, upside_capture_df,
      turnover_avg, turnover_n, port_adj) = build_task1_metrics_table(
-        panel, ff_factors, market_ret, RRR_SIGNAL_COL, 'RRR_Q_ADJ')
+        panel, ff_factors, market_ret, RRR_SIGNAL_COL, 'RRR_Q_MAIN')
 
     sanity_check_against_pipeline(panel, ff_factors, port_adj)
 
@@ -761,16 +592,10 @@ def main():
         print(f"    {row_name}: {METRIC_NOTES[row_name]}")
 
     # =========================================================================
-    # TASK 2
-    # =========================================================================
-    print("\n[3/4] Running Task 2 (SoRR subsection) ...")
-    task2_results = run_task2_sorr(df_filtered, panel, ff_factors, market_ret)
-
-    # =========================================================================
     # SAVE OUTPUTS
     # =========================================================================
-    print("\n[4/4] Saving outputs ...")
-    save_outputs(table1, drawdown_df, upside_capture_df, task2_results)
+    print("\n[3/3] Saving outputs ...")
+    save_outputs(table1, drawdown_df, upside_capture_df)
 
     print("\n" + "=" * 80)
     print("DONE.")
@@ -783,7 +608,6 @@ def main():
         'upside_capture_df': upside_capture_df,
         'turnover_avg': turnover_avg,
         'turnover_n': turnover_n,
-        'task2_results': task2_results,
     }
 
 

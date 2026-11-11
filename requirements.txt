@@ -1,13 +1,11 @@
-pandas
-numpy
-scipy
-matplotlib
-seaborn
-scikit-learn
-statsmodels
-linearmodels
-xgboost
-openpyxl
-python-pptx
-stargazer
-PyMuPDF
+# Direct dependencies of the paper pipeline (run_pipeline.py), pinned to the
+# versions in Code/venv. The full environment, every package with its exact
+# version, is in requirements-lock.txt (pip freeze, 2026-10-20).
+# pandas stays at 2.2.3: pandas 3.x breaks statsmodels 0.14.4.
+matplotlib==3.10.0
+numpy==2.2.1
+openpyxl==3.1.5
+pandas==2.2.3
+scipy==1.15.1
+seaborn==0.13.2
+statsmodels==0.14.4

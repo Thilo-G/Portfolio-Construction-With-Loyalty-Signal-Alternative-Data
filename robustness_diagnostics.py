@@ -57,12 +57,29 @@ warnings.filterwarnings('ignore')
 # =============================================================================
 # PATH CONSTANTS
 # =============================================================================
-CODE_DIR = (
-    r"C:\Users\thkraft\eCommerce-Goethe Dropbox\Thilo Kraft\Thilo(privat)"
-    r"\Privat\Research\RRR_FinancialImplication\Code\RRR-FI-IM"
-)
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))   # Code/RRR-FI-IM
 OUTPUT_DIR = os.path.join(CODE_DIR, "output")
-CANONICAL_PANEL_PATH = os.path.join(OUTPUT_DIR, "canonical_panel_20260719.xlsx")
+def _resolve_canonical_panel(output_dir, pinned):
+    """Return the canonical panel path, preferring the most recent one on disk.
+
+    The filename carries the run date, so pinning one date means every re-run
+    of save_canonical_panel.py silently leaves this script reading a stale
+    panel. Pick the newest canonical_panel_*.xlsx instead, and fall back to the
+    pinned name only if the glob finds nothing.
+    """
+    import glob as _glob
+    import os as _os
+    found = sorted(_glob.glob(_os.path.join(output_dir, "canonical_panel_*.xlsx")))
+    if found:
+        newest = max(found, key=_os.path.getmtime)
+        if newest != pinned:
+            print(f"  [panel] using {_os.path.basename(newest)}")
+        return newest
+    return pinned
+
+
+CANONICAL_PANEL_PATH = _resolve_canonical_panel(
+    OUTPUT_DIR, os.path.join(OUTPUT_DIR, "canonical_panel_20260719.xlsx"))
 DIAG_XLSX_PATH = os.path.join(OUTPUT_DIR, "robustness_diagnostics.xlsx")
 DIAG_MANIFEST_PATH = os.path.join(OUTPUT_DIR, "robustness_diagnostics_manifest.json")
 
@@ -109,7 +126,7 @@ NMV_ROUNDTRIP_COST_BPS_SENSITIVITY = [25.0, 100.0]
 # price/dividend history from about a year before the earliest formation
 # date, so the pull starts well before that with margin on both ends.
 YF_HISTORY_START = "2016-01-01"
-YF_HISTORY_END = "2025-02-01"
+YF_HISTORY_END = "2026-09-30"   # extended for the 2026-09-08 data vintage
 YF_REQUEST_PAUSE_SEC = 0.15  # small delay between yfinance calls
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -157,8 +174,8 @@ def load_base_data():
     df_filtered = df_filtered.sort_values(["FIRM", "DATE"]).set_index(["FIRM", "DATE"])
     n_firms = df_filtered.index.get_level_values("FIRM").nunique()
     print(f"  df_filtered: {df_filtered.shape[0]} firm-quarters, {n_firms} firms")
-    assert n_firms == av2.EXPECTED_N_FIRMS, (
-        f"Canonical panel has {n_firms} firms, expected {av2.EXPECTED_N_FIRMS}. "
+    assert n_firms == av2.EXPECTED_N_FIRMS_PANEL, (
+        f"Canonical panel has {n_firms} firms, expected {av2.EXPECTED_N_FIRMS_PANEL}. "
         f"The snapshot may be stale relative to analysis_v2.py; investigate before trusting results."
     )
 
@@ -167,10 +184,11 @@ def load_base_data():
 
     panel = av2.build_holding_panel(df_filtered, returns)
 
-    # ADJ RRR quartile assignment computed ONCE here and reused by every task
-    # below, so every task shares an identical quartile assignment.
-    panel["ADJ_RRR_PCT"] = pd.to_numeric(panel["ADJ_RRR_PCT"], errors="coerce")
-    panel["RRR_Q_ADJ"] = panel.groupby("QUARTER")["ADJ_RRR_PCT"].transform(av2.safe_quartile)
+    # Headline RRR quartile assignment computed ONCE here and reused by every
+    # task below, so every task shares an identical quartile assignment.
+    # Built on the RAW signal: raw is the paper's primary specification (author decision 2026-09-18).
+    panel["RRR_PCT"] = pd.to_numeric(panel["RRR_PCT"], errors="coerce")
+    panel["RRR_Q_MAIN"] = panel.groupby("QUARTER")["RRR_PCT"].transform(av2.safe_quartile)
 
     market_ret = av2.value_weighted_market(panel)
 
@@ -178,12 +196,12 @@ def load_base_data():
 
 
 def baseline_portfolio_and_regressions(panel, ff_factors, market_ret):
-    """The primary ADJ-RRR value-weighted quartile sort and its FF3/FF3+Mom/FF5
+    """The primary RRR value-weighted quartile sort (raw signal) and its FF3/FF3+Mom/FF5
     factor regressions -- the object every other task compares against.
     """
-    _hdr("BASELINE: ADJ RRR quartile sort, value-weighted (reproduces confirmed headline)")
-    port = av2.build_portfolio_returns(panel, "RRR_Q_ADJ", market_ret)
-    reg = av2.run_factor_regressions(port, ff_factors, "BASELINE ADJ RRR Q1-Q4 VW")
+    _hdr("BASELINE: RRR quartile sort (raw signal), value-weighted (reproduces confirmed headline)")
+    port = av2.build_portfolio_returns(panel, "RRR_Q_MAIN", market_ret)
+    reg = av2.run_factor_regressions(port, ff_factors, "BASELINE RRR Q1-Q4 VW")
     return port, reg
 
 
@@ -279,8 +297,8 @@ def quarter_label(ts):
 def task1_concentration(panel, ff_factors, market_ret, baseline_reg):
     _hdr("TASK 1: CONCENTRATION DIAGNOSTICS")
 
-    w_q1 = leg_weights_by_quarter(panel, "RRR_Q_ADJ", "Q1")
-    w_q4 = leg_weights_by_quarter(panel, "RRR_Q_ADJ", "Q4")
+    w_q1 = leg_weights_by_quarter(panel, "RRR_Q_MAIN", "Q1")
+    w_q4 = leg_weights_by_quarter(panel, "RRR_Q_MAIN", "Q4")
 
     def _eff_n_table(w_df):
         rows = []
@@ -342,11 +360,11 @@ def task1_concentration(panel, ff_factors, market_ret, baseline_reg):
 
         df_exk = panel.merge(drop_keys, on=["FIRM", "QUARTER"], how="left")
         df_exk["DROP_FLAG"] = df_exk["DROP_FLAG"].fillna(False)
-        df_exk["RRR_Q_ADJ_EXK"] = df_exk["RRR_Q_ADJ"].where(
-            ~((df_exk["RRR_Q_ADJ"] == "Q1") & df_exk["DROP_FLAG"]), np.nan
+        df_exk["RRR_Q_MAIN_EXK"] = df_exk["RRR_Q_MAIN"].where(
+            ~((df_exk["RRR_Q_MAIN"] == "Q1") & df_exk["DROP_FLAG"]), np.nan
         )
 
-        port_exk = av2.build_portfolio_returns(df_exk, "RRR_Q_ADJ_EXK", market_ret)
+        port_exk = av2.build_portfolio_returns(df_exk, "RRR_Q_MAIN_EXK", market_ret)
         reg_exk = av2.run_factor_regressions(port_exk, ff_factors, f"Exclude top-{k} from Q1")
 
         row = {
@@ -714,14 +732,14 @@ def task6_dividend_yield_gap(panel):
     print(f"  Done in {time.time()-t0:.1f}s. Successful fetches: {len(hist_data)}/{n_total}. "
           f"Failures: {len(failures)}/{n_total}.")
 
-    # Firm-quarters: one row per (FIRM, QUARTER, RRR_Q_ADJ) with the
+    # Firm-quarters: one row per (FIRM, QUARTER, RRR_Q_MAIN) with the
     # formation date used as the "as of" date for the trailing yield, so the
     # yield is measured contemporaneously with the same signal that drives
     # the portfolio sort (consistent with the rest of the paper's
     # characteristic tables, e.g. portfolio_characteristics.xlsx).
-    fq = (panel.dropna(subset=["RRR_Q_ADJ"])
+    fq = (panel.dropna(subset=["RRR_Q_MAIN"])
           .drop_duplicates(subset=["FIRM", "QUARTER"])
-          .loc[:, ["FIRM", "QUARTER", "FORMATION_DATE", "RRR_Q_ADJ"]].copy())
+          .loc[:, ["FIRM", "QUARTER", "FORMATION_DATE", "RRR_Q_MAIN"]].copy())
     fq["FORMATION_DATE"] = pd.to_datetime(fq["FORMATION_DATE"])
 
     yields, prices = [], []
@@ -739,7 +757,7 @@ def task6_dividend_yield_gap(panel):
     print(f"  ==> yield data available for {n_firms_with_yield} of {n_total} sample firms.")
 
     print("\n  Average trailing dividend yield by ADJ RRR quartile (pooled across firm-quarters):")
-    by_q = fq.groupby("RRR_Q_ADJ")["DIV_YIELD"].agg(["mean", "median", "count"]).reindex(["Q1", "Q2", "Q3", "Q4"])
+    by_q = fq.groupby("RRR_Q_MAIN")["DIV_YIELD"].agg(["mean", "median", "count"]).reindex(["Q1", "Q2", "Q3", "Q4"])
     for q, row in by_q.iterrows():
         print(f"    {q}: mean={row['mean']:.4%}, median={row['median']:.4%}, N obs={row['count']:.0f}")
 
@@ -753,8 +771,8 @@ def task6_dividend_yield_gap(panel):
     # quartile a firm-quarter of theirs ever fell into (a firm can appear in
     # more than one quartile over time, so a firm's average yield can appear
     # in more than one quartile's firm-level average).
-    firm_level = fq.groupby(["FIRM", "RRR_Q_ADJ"])["DIV_YIELD"].mean().reset_index()
-    firm_level_by_q = firm_level.groupby("RRR_Q_ADJ")["DIV_YIELD"].agg(["mean", "count"]).reindex(["Q1", "Q2", "Q3", "Q4"])
+    firm_level = fq.groupby(["FIRM", "RRR_Q_MAIN"])["DIV_YIELD"].mean().reset_index()
+    firm_level_by_q = firm_level.groupby("RRR_Q_MAIN")["DIV_YIELD"].agg(["mean", "count"]).reindex(["Q1", "Q2", "Q3", "Q4"])
     print("\n  Firm-level cross-check (average each firm's own trailing yield first, then average across firms):")
     for q, row in firm_level_by_q.iterrows():
         print(f"    {q}: mean={row['mean']:.4%}, N firms={row['count']:.0f}")
@@ -800,8 +818,8 @@ def one_way_turnover(weights_wide):
 def task7_net_of_cost_alpha(panel, baseline_reg):
     _hdr("TASK 7: NET-OF-COST ALPHA")
 
-    w_q1_wide = leg_weights_wide(panel, "RRR_Q_ADJ", "Q1")
-    w_q4_wide = leg_weights_wide(panel, "RRR_Q_ADJ", "Q4")
+    w_q1_wide = leg_weights_wide(panel, "RRR_Q_MAIN", "Q1")
+    w_q4_wide = leg_weights_wide(panel, "RRR_Q_MAIN", "Q4")
     to_q1 = one_way_turnover(w_q1_wide)
     to_q4 = one_way_turnover(w_q4_wide)
 
@@ -1028,14 +1046,14 @@ def task8_asymmetry(panel, baseline_port, ff_factors, rng):
     # Robustness cut: Q1-vs-Q4 dummy instead of continuous RRR, restricted to
     # firms actually assigned to Q1 or Q4 that quarter (mirrors the portfolio
     # sort's "high vs low RRR" comparison directly).
-    panel_q1q4 = panel.loc[panel["RRR_Q_ADJ"].isin(["Q1", "Q4"]),
-                            ["FIRM", "Date", "QUARTER", "RET_SIMPLE", "RRR_Q_ADJ"]].copy()
+    panel_q1q4 = panel.loc[panel["RRR_Q_MAIN"].isin(["Q1", "Q4"]),
+                            ["FIRM", "Date", "QUARTER", "RET_SIMPLE", "RRR_Q_MAIN"]].copy()
     panel_q1q4["RET_SIMPLE"] = pd.to_numeric(panel_q1q4["RET_SIMPLE"], errors="coerce")
     panel_q1q4["MONTH_P"] = pd.to_datetime(panel_q1q4["Date"]).dt.to_period("M").dt.to_timestamp("M")
     panel_q1q4["MKT_RF"] = panel_q1q4["MONTH_P"].map(mkt)
     panel_q1q4 = panel_q1q4.dropna(subset=["RET_SIMPLE", "MKT_RF"])
     panel_q1q4["UP"] = (panel_q1q4["MKT_RF"] > 0).astype(float)
-    panel_q1q4["Q1_DUMMY"] = (panel_q1q4["RRR_Q_ADJ"] == "Q1").astype(float)
+    panel_q1q4["Q1_DUMMY"] = (panel_q1q4["RRR_Q_MAIN"] == "Q1").astype(float)
 
     h2b_dummy, cluster_note_d, n_d, r2_d = _fit_h2b(panel_q1q4, "Q1_DUMMY", "Q1-vs-Q4 dummy specification (robustness)")
 

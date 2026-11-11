@@ -38,13 +38,19 @@ from scipy.stats import pearsonr
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-DATA_DIR = r"C:\Users\thkraft\eCommerce-Goethe Dropbox\Thilo Kraft\Thilo(privat)\Privat\Research\RRR_FinancialImplication\Data"
-SUPPORT_DIR = r"C:\Users\thkraft\eCommerce-Goethe Dropbox\Thilo Kraft\Thilo(privat)\Privat\Research\RRR_FinancialImplication\Supporting-Documents"
-OUTPUT_DIR = r"C:\Users\thkraft\eCommerce-Goethe Dropbox\Thilo Kraft\Thilo(privat)\Privat\Research\RRR_FinancialImplication\Code\RRR-FI-IM\output"
+_CODE_DIR = os.path.dirname(os.path.abspath(__file__))                 # Code/RRR-FI-IM
+_PROJECT_DIR = os.path.dirname(os.path.dirname(_CODE_DIR))             # RRR_FinancialImplication
+DATA_DIR = os.path.join(_PROJECT_DIR, 'Data')
+SUPPORT_DIR = os.path.join(_PROJECT_DIR, 'Supporting-Documents')
+OUTPUT_DIR = os.path.join(_CODE_DIR, 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-REVENUE_FILE = os.path.join(DATA_DIR, "2025-0319a-TK-quarterlyrevenue-collection_Python.xlsx")
-FUNDAMENTALS_FILE = os.path.join(DATA_DIR, "2025-0319a-TK-fundamentals_Python.xlsx")
+# 2026-09-08: both now live as sheets in the consolidated workbook.
+DATA_WORKBOOK = os.path.join(DATA_DIR, "20260904-Firms-Quarterly-Revenue-Fundamentals-Python.xlsx")
+REVENUE_FILE = DATA_WORKBOOK
+FUNDAMENTALS_FILE = DATA_WORKBOOK
+REVENUE_SHEET = "Quarterly_Revenue_Values"
+FUNDAMENTALS_SHEET = "Quarterly_Fundamentals_Value"
 WORKBOOK_FILE = os.path.join(DATA_DIR, "Firms-Quarterly-Revenue-Fundamentals-2025-07-02-BBG.xlsx")
 INDUSTRY_FILE = os.path.join(SUPPORT_DIR, "Firms-Industry-2025-11-21-Python.xlsx")
 
